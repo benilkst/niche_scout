@@ -1,0 +1,716 @@
+/**
+ * @license
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+import crypto from 'crypto';
+import { GoogleGenAI, Type } from '@google/genai';
+import { GEMINI_MODEL_NAME } from '../src/config/model.ts';
+import type { KandidatNiche, SumberRef, StatusDukungan, LevelBukti } from '../src/types.ts';
+
+// Inisialisasi SDK di sisi server
+// Aturan 2: API key Gemini hanya di server (process.env.GEMINI_API_KEY)
+const ai = new GoogleGenAI({
+  apiKey: process.env.GEMINI_API_KEY,
+  httpOptions: {
+    headers: {
+      'User-Agent': 'aistudio-build',
+    },
+  },
+});
+
+export interface NicheHandlerRequest {
+  tipe_aset: 'foto_nyata' | 'foto_ai' | 'ilustrasi_ai';
+  tema?: string;
+  momen_id?: string | null;
+  momen_tahun?: number | null;
+  nama_momen?: string | null;
+  tanggal_puncak_target?: string | null;
+  status_jendela?: string | null;
+  hari_tersisa?: number | null;
+  rentang_jendela?: string | null;
+  jumlah_kandidat?: number;
+}
+
+export interface NicheHandlerResponse {
+  success: boolean;
+  kunci_cache: string;
+  status: 'tergrounded' | 'tidak_tergrounded' | 'galat';
+  pesan_galat: string | null;
+  web_search_queries: string[];
+  search_entry_point_html: string | null;
+  kandidat: KandidatNiche[];
+}
+
+interface ParsedBlock {
+  nomor: number;
+  rawText: string;
+  startByte: number;
+  endByte: number;
+  bodyStartByte: number;
+  bodyEndByte: number;
+}
+
+/**
+ * Ekstrak domain dari URI sumber.
+ * Aturan: Jika uri berupa tautan pengalih milik Google, gunakan title sebagai domain;
+ * jika tidak, ambil host dari uri. Jangan menelusuri tautan pengalih.
+ */
+function extractCleanDomain(uri: string, title?: string): string {
+  try {
+    const parsed = new URL(uri);
+    let host = parsed.hostname.toLowerCase();
+    if (host.includes('google.com') && (parsed.pathname.includes('/url') || parsed.pathname.includes('search'))) {
+      // Gunakan title jika redirect link
+      return title ? title.slice(0, 35) : host;
+    }
+    if (host.startsWith('www.')) host = host.slice(4);
+    if (host.startsWith('m.')) host = host.slice(2);
+    if (host.startsWith('amp.')) host = host.slice(4);
+    return host;
+  } catch {
+    return title ? title.slice(0, 35) : 'web-source';
+  }
+}
+
+/**
+ * Pemetaan sumber oleh kode menggunakan offset byte UTF-8 (Buffer)
+ */
+function mapSourcesToBlocksByByteOffset(
+  fullText: string,
+  blocks: ParsedBlock[],
+  groundingChunks: Array<{ web?: { uri?: string; title?: string } }>,
+  groundingSupports: Array<{
+    segment?: { startIndex?: number; endIndex?: number; text?: string };
+    groundingChunkIndices?: number[];
+  }>
+): Map<number, { sumber: SumberRef[]; cakupan_dukungan: number | null }> {
+  const result = new Map<number, { sumber: SumberRef[]; cakupan_dukungan: number | null }>();
+
+  // Siapkan referensi sumber dari groundingChunks
+  const chunkList: Array<{ url: string; title: string; domain: string }> = groundingChunks.map((chunk) => {
+    const uri = chunk.web?.uri || '';
+    const title = chunk.web?.title || uri;
+    const domain = extractCleanDomain(uri, title);
+    return { url: uri, title, domain };
+  });
+
+  const nowIso = new Date().toISOString();
+
+  // Untuk setiap blok kandidat
+  for (const block of blocks) {
+    const matchedChunkIndices = new Set<number>();
+    let coveredBytes = 0;
+
+    const blockBodyLength = Math.max(1, block.bodyEndByte - block.bodyStartByte);
+
+    // Kumpulkan interval byte support yang overlapping dengan badan blok
+    const overlappingIntervals: Array<{ start: number; end: number }> = [];
+
+    for (const support of groundingSupports) {
+      const segStart = typeof support.segment?.startIndex === 'number' ? support.segment.startIndex : -1;
+      const segEnd = typeof support.segment?.endIndex === 'number' ? support.segment.endIndex : -1;
+
+      if (segStart < 0 || segEnd <= segStart) continue;
+
+      // Cek apakah segmen bersinggungan dengan badan blok
+      const overlapStart = Math.max(block.bodyStartByte, segStart);
+      const overlapEnd = Math.min(block.bodyEndByte, segEnd);
+
+      if (overlapEnd > overlapStart) {
+        // Terdapat persinggungan
+        overlappingIntervals.push({ start: overlapStart, end: overlapEnd });
+
+        if (Array.isArray(support.groundingChunkIndices)) {
+          for (const idx of support.groundingChunkIndices) {
+            if (idx >= 0 && idx < chunkList.length) {
+              matchedChunkIndices.add(idx);
+            }
+          }
+        }
+      }
+    }
+
+    // Hitung total byte tertutup tanpa duplikasi overlap interval
+    if (overlappingIntervals.length > 0) {
+      overlappingIntervals.sort((a, b) => a.start - b.start);
+      let mergedStart = overlappingIntervals[0].start;
+      let mergedEnd = overlappingIntervals[0].end;
+
+      for (let i = 1; i < overlappingIntervals.length; i++) {
+        const curr = overlappingIntervals[i];
+        if (curr.start <= mergedEnd) {
+          mergedEnd = Math.max(mergedEnd, curr.end);
+        } else {
+          coveredBytes += mergedEnd - mergedStart;
+          mergedStart = curr.start;
+          mergedEnd = curr.end;
+        }
+      }
+      coveredBytes += mergedEnd - mergedStart;
+    }
+
+    // Bentuk daftar SumberRef unik (dedupe per URL)
+    const sumberMap = new Map<string, SumberRef>();
+    for (const idx of matchedChunkIndices) {
+      const item = chunkList[idx];
+      if (item && item.url) {
+        sumberMap.set(item.url, {
+          domain: item.domain,
+          url: item.url,
+          judul: item.title,
+          tanggal_akses: nowIso,
+        });
+      }
+    }
+
+    const sumberUnique = Array.from(sumberMap.values());
+    const cakupan =
+      sumberUnique.length > 0
+        ? Math.min(1, Math.max(0, Number((coveredBytes / blockBodyLength).toFixed(2))))
+        : null;
+
+    result.set(block.nomor, {
+      sumber: sumberUnique,
+      cakupan_dukungan: cakupan,
+    });
+  }
+
+  return result;
+}
+
+/**
+ * Memecah teks Langkah A berdasarkan penanda "## KANDIDAT n"
+ * Menghitung offset byte UTF-8 secara presisi dengan TextEncoder
+ */
+function splitTextIntoCandidateBlocks(fullText: string): ParsedBlock[] {
+  const encoder = new TextEncoder();
+  const blocks: ParsedBlock[] = [];
+
+  // Regex mencari penanda "## KANDIDAT n"
+  const regex = /##\s*KANDIDAT\s*(\d+)/gi;
+  const matches: Array<{ nomor: number; charIndex: number }> = [];
+
+  let match: RegExpExecArray | null;
+  while ((match = regex.exec(fullText)) !== null) {
+    const nomor = parseInt(match[1], 10);
+    matches.push({ nomor, charIndex: match.index });
+  }
+
+  for (let i = 0; i < matches.length; i++) {
+    const curr = matches[i];
+    const nextCharIndex = i + 1 < matches.length ? matches[i + 1].charIndex : fullText.length;
+
+    const blockText = fullText.slice(curr.charIndex, nextCharIndex);
+
+    // Hitung offset byte UTF-8
+    const startByte = encoder.encode(fullText.slice(0, curr.charIndex)).length;
+    const endByte = startByte + encoder.encode(blockText).length;
+
+    // Header penanda baris pertama (misal: "## KANDIDAT 1\n")
+    const firstNewline = blockText.indexOf('\n');
+    const headerSlice = firstNewline >= 0 ? blockText.slice(0, firstNewline + 1) : blockText;
+    const headerByteLen = encoder.encode(headerSlice).length;
+
+    const bodyStartByte = startByte + headerByteLen;
+    const bodyEndByte = endByte;
+
+    blocks.push({
+      nomor: curr.nomor,
+      rawText: blockText.trim(),
+      startByte,
+      endByte,
+      bodyStartByte,
+      bodyEndByte,
+    });
+  }
+
+  return blocks;
+}
+
+/**
+ * Eksekusi Langkah B: JSON terstruktur via Gemini (tanpa tool)
+ */
+async function executeStepBStructure(
+  blocks: ParsedBlock[],
+  retryCount: number = 0
+): Promise<any[]> {
+  const blocksInput = blocks.map((b) => ({
+    nomor: b.nomor,
+    teks: b.rawText,
+  }));
+
+  const promptB = `
+Anda adalah parser data microstock presisi tinggi.
+Tugas Anda: Mengubah blok-blok teks kandidat berikut menjadi array JSON terstruktur persis tanpa menambah atau mengarang informasi baru.
+Semua informasi teks HARUS diambil secara murni dan setia dari teks input blok masing-masing.
+
+Blok Input:
+${JSON.stringify(blocksInput, null, 2)}
+
+Peraturan Ekstraksi:
+- Jumlah objek yang dihasilkan HARUS PERSIS sama dengan ${blocks.length}.
+- nomor HARUS cocok dengan nomor blok masing-masing (misal 1, 2, ...).
+- Field wajib:
+  - nomor: number
+  - kata_kunci_en: string (ambil dari "Kata kunci (EN):")
+  - varian_id: string (ambil dari "Varian Indonesia:")
+  - alasan: string (ambil dari "Alasan:")
+  - sinyal_tren: string (ambil dari "Sinyal tren:")
+  - saran_sudut: objek { copy_space: string, konteks_lokal: string, gaya: string }
+  - saran_permintaan_1_5: number (1 sampai 5) atau null jika tidak ada bukti
+  - risiko_merek: objek { ada: boolean, alasan: string | null }
+`.trim();
+
+  const responseB = await ai.models.generateContent({
+    model: GEMINI_MODEL_NAME,
+    contents: promptB,
+    config: {
+      responseMimeType: 'application/json',
+      responseSchema: {
+        type: Type.ARRAY,
+        items: {
+          type: Type.OBJECT,
+          properties: {
+            nomor: { type: Type.INTEGER },
+            kata_kunci_en: { type: Type.STRING },
+            varian_id: { type: Type.STRING },
+            alasan: { type: Type.STRING },
+            sinyal_tren: { type: Type.STRING },
+            saran_sudut: {
+              type: Type.OBJECT,
+              properties: {
+                copy_space: { type: Type.STRING },
+                konteks_lokal: { type: Type.STRING },
+                gaya: { type: Type.STRING },
+              },
+              required: ['copy_space', 'konteks_lokal', 'gaya'],
+            },
+            saran_permintaan_1_5: { type: Type.INTEGER },
+            risiko_merek: {
+              type: Type.OBJECT,
+              properties: {
+                ada: { type: Type.BOOLEAN },
+                alasan: { type: Type.STRING },
+              },
+              required: ['ada'],
+            },
+          },
+          required: [
+            'nomor',
+            'kata_kunci_en',
+            'varian_id',
+            'alasan',
+            'sinyal_tren',
+            'saran_sudut',
+            'risiko_merek',
+          ],
+        },
+      },
+    },
+  });
+
+  const parsed = JSON.parse(responseB.text || '[]');
+  const list = Array.isArray(parsed) ? parsed : [];
+
+  // Validasi: jumlah objek sama dengan jumlah blok dan nomor cocok
+  const isValidCount = list.length === blocks.length;
+  const isNumbersMatching = blocks.every((b, idx) => list[idx] && list[idx].nomor === b.nomor);
+
+  if (!isValidCount || !isNumbersMatching) {
+    if (retryCount === 0) {
+      // Coba ulang SEKALI sesuai spesifikasi
+      return executeStepBStructure(blocks, 1);
+    }
+    throw new Error(
+      `Validasi Langkah B gagal: jumlah kandidat (${list.length}) tidak sesuai blok (${blocks.length}).`
+    );
+  }
+
+  return list;
+}
+
+/**
+ * Handler utama pencarian dua langkah
+ */
+export async function handleNicheScout(params: NicheHandlerRequest): Promise<NicheHandlerResponse> {
+  const {
+    tipe_aset,
+    tema = '',
+    momen_id = null,
+    momen_tahun = null,
+    nama_momen = null,
+    tanggal_puncak_target = null,
+    status_jendela = null,
+    hari_tersisa = null,
+    rentang_jendela = null,
+    jumlah_kandidat = 10,
+  } = params;
+
+  // 1. Validasi Input
+  if (!tipe_aset || !['foto_nyata', 'foto_ai', 'ilustrasi_ai'].includes(tipe_aset)) {
+    throw new Error('Tipe aset wajib dan harus berupa: foto_nyata, foto_ai, atau ilustrasi_ai.');
+  }
+
+  const cleanTema = typeof tema === 'string' ? tema.trim().slice(0, 80) : '';
+  const count = Math.min(15, Math.max(3, Number(jumlah_kandidat) || 10));
+
+  const labelTipeAset =
+    tipe_aset === 'foto_nyata'
+      ? 'Foto Nyata (keaslian, staging fisik, model dan property release, lokasi otentik)'
+      : tipe_aset === 'foto_ai'
+        ? 'Foto AI Generatif (fotorealistik, konsep unik, hindari wajah tokoh nyata dan merek)'
+        : 'Ilustrasi AI / Vektor AI (vektor komersial, flat, 3D icon set, background copy space)';
+
+  // Tanggal hari ini dari server (Aturan Tahap 2)
+  const todayServer = new Date().toISOString().slice(0, 10);
+
+  // Kunci cache unik
+  const todayLocal = new Date().toLocaleDateString('en-CA');
+  const kunci_cache = `cache_${tipe_aset}_${cleanTema.toLowerCase().replace(/\s+/g, '_')}_${momen_id || 'none'}_${count}_${todayLocal}`;
+
+  // Konteks Musiman jika ada (Tahap 5)
+  const konteksMusimanText =
+    nama_momen && tanggal_puncak_target
+      ? `
+Target Momen: ${nama_momen}.
+Target puncak: ${tanggal_puncak_target}. Jendela unggah ideal: ${rentang_jendela || '120 s/d 60 hari sebelum puncak'}.
+Cari sinyal permintaan untuk musim tersebut dan jangan menyarankan produksi untuk musim yang sudah lewat.
+${
+  status_jendela === 'Jendela sudah lewat (target musim berikutnya)'
+    ? 'CATATAN KHUSUS: Jendela unggah musim tahun ini sudah lewat (< 60 hari). Semua konsep dan rekomendasi kata kunci HARUS ditujukan untuk persiapan produksi MUSIM BERIKUTNYA (' +
+      tanggal_puncak_target +
+      '). Sertakan konteks musim berikutnya pada alasan atau deskripsi jika relevan.'
+    : ''
+}
+`.trim()
+      : '';
+
+  // 2. LANGKAH A: Panggil Gemini dengan tool googleSearch
+  const promptA = `
+Tanggal Hari Ini (Server): ${todayServer}.
+Peran: Anda analis tren pasar microstock (Adobe Stock, Shutterstock, Freepik, Getty Images/iStock).
+Tugas: Cari sinyal permintaan terkini untuk ${labelTipeAset} dengan tema "${cleanTema || 'umum / tren komersial paling dicari'}".
+${konteksMusimanText ? `\n${konteksMusimanText}\n` : ''}
+Hasilkan TEPAT ${count} kandidat ide niche.
+
+Gunakan format persis untuk setiap kandidat:
+## KANDIDAT n
+Kata kunci (EN): <5-8 kata kunci relevan bahasa Inggris>
+Varian Indonesia: <nama konsep dalam Bahasa Indonesia>
+Alasan: <kebutuhan pembeli microstock berdasarkan hasil pencarian>
+Sinyal tren: <sinyal kenaikan permintaan atau data relevan dari pencarian, jika tidak ada tulis "Sinyal tidak ditemukan">
+Copy space: <rekomendasi ruang kosong negatif untuk teks desain>
+Konteks lokal: <sentuhan budaya atau kearifan lokal spesifik>
+Gaya: <komposisi, pencahayaan, sudut kamera atau gaya ilustrasi>
+
+ATURAN SANGAT KETAT:
+1. Alasan dan sinyal tren HANYA boleh berdasar hasil pencarian;
+2. Jangan menulis angka, persentase, atau statistik yang tidak ada di sumber;
+3. Jika tidak menemukan sinyal untuk sebuah kandidat, tulis "Sinyal tidak ditemukan";
+4. JANGAN PERNAH menyarankan nama merek (misal Lego, Apple, Nike, Barbie, Disney, dll.), karakter berhak cipta, produk bermerek, atau tokoh nyata;
+5. Sesuaikan sudut kreatif dengan tipe aset:
+   - Foto nyata: sebutkan kebutuhan model/property release dan lokasi;
+   - AI: ingatkan hindari wajah tokoh nyata dan merek dagang.
+`.trim();
+
+  let responseA: any;
+  try {
+    responseA = await ai.models.generateContent({
+      model: GEMINI_MODEL_NAME,
+      contents: promptA,
+      config: {
+        tools: [{ googleSearch: {} }],
+      },
+    });
+  } catch (err: any) {
+    if (err?.status === 429 || err?.message?.includes('429') || err?.message?.includes('RESOURCE_EXHAUSTED')) {
+      throw new Error('429: Batas kuota permintaan Gemini API tercapai. Silakan coba kembali beberapa saat lagi.');
+    }
+    throw new Error('Gagal menghubungi layanan pencarian grounding Gemini.');
+  }
+
+  const candidateZero = responseA?.candidates?.[0];
+  const fullText = responseA?.text || '';
+  const groundingMetadata = candidateZero?.groundingMetadata;
+
+  const webSearchQueries: string[] = Array.isArray(groundingMetadata?.webSearchQueries)
+    ? groundingMetadata.webSearchQueries
+    : [];
+
+  const searchEntryPointHtml: string | null =
+    groundingMetadata?.searchEntryPoint?.renderedContent || null;
+
+  const groundingChunks = Array.isArray(groundingMetadata?.groundingChunks)
+    ? groundingMetadata.groundingChunks
+    : [];
+
+  const groundingSupports = Array.isArray(groundingMetadata?.groundingSupports)
+    ? groundingMetadata.groundingSupports
+    : [];
+
+  const isGrounded = !!(groundingChunks.length > 0);
+
+  // 3. Pemecahan teks menjadi blok-blok kandidat
+  const blocks = splitTextIntoCandidateBlocks(fullText);
+
+  if (blocks.length === 0) {
+    throw new Error('Format jawaban Langkah A tidak menghasilkan blok kandidat yang dapat dibaca.');
+  }
+
+  // 4. PEMETAAN SUMBER OLEH KODE MENGGUNAKAN OFFSET BYTE UTF-8
+  const sourceMapping = mapSourcesToBlocksByByteOffset(
+    fullText,
+    blocks,
+    groundingChunks,
+    groundingSupports
+  );
+
+  // 5. LANGKAH B: JSON terstruktur via Gemini (tanpa tool)
+  const structuredList = await executeStepBStructure(blocks);
+
+  // 6. GABUNGKAN HASIL LANGKAH B DENGAN SUMBER DAN CAKUPAN DARI KODE
+  const idPencarian = `search-${Date.now()}`;
+  const nowIso = new Date().toISOString();
+
+  const finalKandidat: KandidatNiche[] = structuredList.map((item, idx) => {
+    const nomor = item.nomor || idx + 1;
+    const mapping = sourceMapping.get(nomor) || { sumber: [], cakupan_dukungan: null };
+
+    const sumber = mapping.sumber;
+    const cakupan = mapping.cakupan_dukungan;
+
+    // Hitung level bukti dan status dukungan murni oleh KODE (Aturan 3 & Tahap 2)
+    let bukti: LevelBukti = 'tidak_ada';
+    let dukungan: StatusDukungan = 'tidak_diketahui';
+
+    if (isGrounded && sumber.length > 0) {
+      if (sumber.length >= 2 && (cakupan ?? 0) >= 0.4) {
+        bukti = 'kuat';
+        dukungan = 'didukung';
+      } else if (sumber.length >= 1) {
+        bukti = 'sedang';
+        dukungan = 'sebagian';
+      } else {
+        bukti = 'lemah';
+        dukungan = 'sebagian';
+      }
+    } else {
+      bukti = 'tidak_ada';
+      dukungan = 'tidak_didukung';
+    }
+
+    // Periksa risiko merek dari kata kunci
+    const brandCheck = item.risiko_merek || { ada: false, alasan: null };
+
+    return {
+      id: `kandidat-${idPencarian}-${nomor}`,
+      id_pencarian: idPencarian,
+      nomor,
+      kata_kunci_en: String(item.kata_kunci_en || ''),
+      varian_id: String(item.varian_id || ''),
+      alasan: String(item.alasan || ''),
+      sinyal_tren: String(item.sinyal_tren || 'Sinyal tidak ditemukan'),
+      saran_sudut: {
+        copy_space: item.saran_sudut?.copy_space || 'Ruang kosong bersih untuk teks',
+        konteks_lokal: item.saran_sudut?.konteks_lokal || 'Elemen lokal Indonesia',
+        gaya: item.saran_sudut?.gaya || 'Komersial microstock',
+      },
+      sumber,
+      jumlah_domain: new Set(sumber.map((s) => s.domain)).size,
+      cakupan_dukungan: cakupan,
+      dukungan,
+      bukti,
+      saran_permintaan_1_5: isGrounded ? (typeof item.saran_permintaan_1_5 === 'number' ? item.saran_permintaan_1_5 : 3) : null,
+      risiko_merek: {
+        ada: Boolean(brandCheck.ada),
+        alasan: brandCheck.alasan || null,
+      },
+      mirip_dengan: null,
+      sudah_pernah_muncul: false,
+      status: 'baru',
+      catatan: '',
+      tag: (item.kata_kunci_en || '').split(/\s*,\s*|\s+/).filter(Boolean).slice(0, 8),
+      dibuat_pada: nowIso,
+    };
+  });
+
+  return {
+    success: true,
+    kunci_cache,
+    status: isGrounded ? 'tergrounded' : 'tidak_tergrounded',
+    pesan_galat: null,
+    web_search_queries: webSearchQueries,
+    search_entry_point_html: searchEntryPointHtml,
+    kandidat: finalKandidat,
+  };
+}
+
+/**
+ * Aturan 4 (Tahap 6): Perbandingan timing-safe untuk kode akses
+ */
+export function verifyPasscode(providedPasscode: string | undefined | null): { allowed: boolean; status?: number; error?: string } {
+  const envPasscode = process.env.APP_PASSCODE;
+  const isProd = process.env.NODE_ENV === 'production';
+
+  // Jika di lingkungan pratinjau AI Studio / dev dan APP_PASSCODE belum diatur, boleh dilewati
+  if (!envPasscode) {
+    if (isProd) {
+      // Gagal tertutup di produksi jika APP_PASSCODE belum diatur (tolak semua panggilan)
+      return {
+        allowed: false,
+        status: 401,
+        error: 'Akses ditolak. Konfigurasi kode akses server belum diatur di produksi.',
+      };
+    }
+    // Pratinjau AI Studio / dev: boleh dilewati jika APP_PASSCODE kosong
+    return { allowed: true };
+  }
+
+  // Jika APP_PASSCODE diatur, kode akses wajib ada dan cocok
+  if (!providedPasscode || typeof providedPasscode !== 'string') {
+    return {
+      allowed: false,
+      status: 401,
+      error: 'Kode akses diperlukan. Silakan masukkan kode akses pada aplikasi.',
+    };
+  }
+
+  // Bandingkan secara timing-safe menggunakan SHA-256 digest untuk menjamin panjang buffer sama persis
+  const hashProvided = crypto.createHash('sha256').update(providedPasscode).digest();
+  const hashEnv = crypto.createHash('sha256').update(envPasscode).digest();
+
+  const isMatch = crypto.timingSafeEqual(hashProvided, hashEnv);
+  if (!isMatch) {
+    return {
+      allowed: false,
+      status: 401,
+      error: 'Kode akses salah. Silakan periksa kembali kode akses Anda.',
+    };
+  }
+
+  return { allowed: true };
+}
+
+/**
+ * Handler bersama untuk rute /api/niche yang dapat dipanggil oleh Express (server.ts) maupun Vercel Serverless (api/niche.ts)
+ */
+export async function handleApiNicheRequest(req: any, res: any): Promise<void> {
+  // Hanya menerima metode POST
+  if (req.method !== 'POST') {
+    res.status(405).json({
+      success: false,
+      status: 'galat',
+      pesan_galat: 'Metode tidak diizinkan. Gunakan POST.',
+      kandidat: [],
+    });
+    return;
+  }
+
+  // 1. Verifikasi Kode Akses
+  const headerPasscode =
+    req.headers?.['x-app-passcode'] ||
+    req.headers?.['X-App-Passcode'] ||
+    req.headers?.['x-app-passcode'.toLowerCase()];
+
+  const auth = verifyPasscode(typeof headerPasscode === 'string' ? headerPasscode : undefined);
+  if (!auth.allowed) {
+    res.status(auth.status || 401).json({
+      success: false,
+      status: 'galat',
+      pesan_galat: auth.error || 'Akses tidak sah.',
+      kandidat: [],
+    });
+    return;
+  }
+
+  // 2. Validasi Server (tanpa membocorkan detail internal atau mencatat isi input ke log)
+  const body = req.body || {};
+  const {
+    tipe_aset,
+    tema,
+    momen_id,
+    momen_tahun,
+    nama_momen,
+    tanggal_puncak_target,
+    status_jendela,
+    hari_tersisa,
+    rentang_jendela,
+    jumlah_kandidat,
+  } = body;
+
+  if (!tipe_aset || !['foto_nyata', 'foto_ai', 'ilustrasi_ai'].includes(tipe_aset)) {
+    res.status(400).json({
+      success: false,
+      status: 'galat',
+      pesan_galat: 'Permintaan tidak valid: Tipe aset harus foto_nyata, foto_ai, atau ilustrasi_ai.',
+      kandidat: [],
+    });
+    return;
+  }
+
+  if (tema && typeof tema === 'string' && tema.trim().length > 100) {
+    res.status(400).json({
+      success: false,
+      status: 'galat',
+      pesan_galat: 'Permintaan tidak valid: Panjang tema maksimal 100 karakter.',
+      kandidat: [],
+    });
+    return;
+  }
+
+  const count = Number(jumlah_kandidat) || 10;
+  if (count < 3 || count > 15) {
+    res.status(400).json({
+      success: false,
+      status: 'galat',
+      pesan_galat: 'Permintaan tidak valid: Jumlah kandidat harus antara 3 dan 15.',
+      kandidat: [],
+    });
+    return;
+  }
+
+  // 3. Pastikan GEMINI_API_KEY tersedia di server
+  if (!process.env.GEMINI_API_KEY) {
+    res.status(500).json({
+      success: false,
+      status: 'galat',
+      pesan_galat: 'Layanan sedang sibuk. Silakan coba kembali nanti.',
+      kandidat: [],
+    });
+    return;
+  }
+
+  // 4. Jalankan riset niche dua langkah
+  try {
+    const result = await handleNicheScout({
+      tipe_aset,
+      tema: typeof tema === 'string' ? tema.trim() : '',
+      momen_id: momen_id || null,
+      momen_tahun: momen_tahun || null,
+      nama_momen: typeof nama_momen === 'string' ? nama_momen : null,
+      tanggal_puncak_target: typeof tanggal_puncak_target === 'string' ? tanggal_puncak_target : null,
+      status_jendela: status_jendela || null,
+      hari_tersisa: typeof hari_tersisa === 'number' ? hari_tersisa : null,
+      rentang_jendela: typeof rentang_jendela === 'string' ? rentang_jendela : null,
+      jumlah_kandidat: count,
+    });
+
+    res.status(200).json(result);
+  } catch (err: any) {
+    const msg = err?.message || '';
+    const isRateLimit = msg.includes('429') || msg.includes('RESOURCE_EXHAUSTED');
+
+    res.status(isRateLimit ? 429 : 500).json({
+      success: false,
+      status: 'galat',
+      pesan_galat: isRateLimit
+        ? 'Layanan sedang sibuk (batas kuota API tercapai). Mohon tunggu beberapa saat sebelum mencoba kembali.'
+        : 'Layanan sedang sibuk. Gagal memproses pencarian niche saat ini.',
+      web_search_queries: [],
+      search_entry_point_html: null,
+      kandidat: [],
+    });
+  }
+}
+

@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="id">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <title>Niche Scout - Ide Niche Microstock</title>
+    <meta name="description" content="Aplikasi pencari ide niche microstock (foto nyata, foto AI, ilustrasi AI) memakai Gemini dengan Google Search grounding." />
+    <meta property="og:title" content="Niche Scout - Ide Niche Microstock" />
+    <meta property="og:description" content="Aplikasi pencari ide niche microstock (foto nyata, foto AI, ilustrasi AI) memakai Gemini dengan Google Search grounding." />
+    <meta property="og:type" content="website" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="Niche Scout" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="theme-color" content="#0f172a" />
+    <link rel="icon" type="image/svg+xml" href="/icon.svg" />
+    <link rel="apple-touch-icon" href="/icons/apple-touch-icon.png" />
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <script>
+      (function() {
+        // Tangani dan abaikan error koneksi WebSocket/HMR di lingkungan preview iframe (HMR: Disabled)
+        window.addEventListener('unhandledrejection', function(event) {
+          var reason = event.reason;
+          var msg = (reason && (reason.message || reason.stack || String(reason))) || '';
+          if (msg.includes('WebSocket') || msg.includes('@vite/client') || msg.includes('vite:ws')) {
+            event.preventDefault();
+            if (event.stopImmediatePropagation) event.stopImmediatePropagation();
+          }
+        });
+        window.addEventListener('error', function(event) {
+          var msg = (event.message || (event.error && (event.error.message || event.error.stack)) || '') + '';
+          var filename = event.filename || '';
+          if (filename.includes('@vite/client') || msg.includes('WebSocket') || msg.includes('vite:ws')) {
+            event.preventDefault();
+            if (event.stopImmediatePropagation) event.stopImmediatePropagation();
+          }
+        });
+
+        // Inisialisasi skala CSS sebelum render untuk mencegah layout shift
+        try {
+          var raw = localStorage.getItem('niche_scout_store_v1');
+          var skala = 0.7;
+          if (raw) {
+            var parsed = JSON.parse(raw);
+            if (parsed && parsed.pengaturan && typeof parsed.pengaturan.skala === 'number') {
+              skala = parsed.pengaturan.skala;
+            }
+          }
+          document.documentElement.style.setProperty('--skala', String(skala));
+        } catch (e) {
+          document.documentElement.style.setProperty('--skala', '0.7');
+        }
+      })();
+    </script>
+  </head>
+  <body class="bg-slate-900 text-slate-100 antialiased selection:bg-emerald-500 selection:text-white">
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
+
+

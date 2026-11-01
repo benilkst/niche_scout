@@ -1,0 +1,7 @@
+{
+  "name": "Niche Scout",
+  "description": "Aplikasi pencari ide niche microstock (foto nyata, foto AI, ilustrasi AI) memakai Gemini dengan Google Search grounding.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
+
