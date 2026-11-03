@@ -23,6 +23,7 @@ import {
   Trash2,
   CheckCircle2,
   Lock,
+  KeyRound,
 } from 'lucide-react';
 import { AppDataStore, KandidatNiche, PencarianRecord } from '../types.ts';
 import { KandidatCard } from './KandidatCard.tsx';
@@ -52,6 +53,7 @@ interface CariViewProps {
   onClearReopenedData?: () => void;
   momenAwalId?: string | null;
   onBukaPanduan?: (sectionId?: string) => void;
+  onBukaPengaturan?: () => void;
 }
 
 export const CariView: React.FC<CariViewProps> = ({
@@ -64,6 +66,7 @@ export const CariView: React.FC<CariViewProps> = ({
   onClearReopenedData,
   momenAwalId,
   onBukaPanduan,
+  onBukaPengaturan,
 }) => {
   // Form State
   const [tipeAset, setTipeAset] = useState<'foto_nyata' | 'foto_ai' | 'ilustrasi_ai'>('foto_nyata');
@@ -100,18 +103,6 @@ export const CariView: React.FC<CariViewProps> = ({
   // Modal Konfirmasi Melewati Batas Harian & Abaikan Cache
   const [modalBatasBuka, setModalBatasBuka] = useState(false);
   const [modalAbaikanCacheBuka, setModalAbaikanCacheBuka] = useState(false);
-
-  // Modal Kode Akses (Tahap 6)
-  const [modalPasscodeBuka, setModalPasscodeBuka] = useState(false);
-  const [inputPasscode, setInputPasscode] = useState(() => {
-    try {
-      return localStorage.getItem('niche_scout_passcode') || '';
-    } catch {
-      return '';
-    }
-  });
-  const [passcodeError, setPasscodeError] = useState<string | null>(null);
-  const [pendingKunciCache, setPendingKunciCache] = useState<string | null>(null);
 
   // AbortController ref untuk tombol Batal
   const abortControllerRef = useRef<AbortController | null>(null);
@@ -217,7 +208,7 @@ export const CariView: React.FC<CariViewProps> = ({
     setErrorPesan('Pencarian dibatalkan oleh pengguna.');
   };
 
-  const eksekusiPanggilanServer = async (kunciCache: string, overridePasscode?: string) => {
+  const eksekusiPanggilanServer = async (kunciCache: string) => {
     // 5. Penanganan offline (Tahap 6)
     if (typeof navigator !== 'undefined' && !navigator.onLine) {
       setErrorPesan('Pencarian membutuhkan koneksi internet untuk memeriksa sumber.');
@@ -235,24 +226,26 @@ export const CariView: React.FC<CariViewProps> = ({
     abortControllerRef.current = controller;
 
     try {
-      let passcodeToSend = overridePasscode;
-      if (typeof passcodeToSend !== 'string') {
-        try {
-          passcodeToSend = localStorage.getItem('niche_scout_passcode') || '';
-        } catch {
-          passcodeToSend = '';
-        }
+      let customApiKey = '';
+      try {
+        customApiKey = localStorage.getItem('niche_scout_gemini_api_key') || '';
+      } catch {
+        customApiKey = '';
       }
 
       const selectedMomen = store.momen.find((m) => m.id === momenId);
       const jendela = selectedMomen ? hitungJendelaMomen(selectedMomen) : null;
 
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/json',
+      };
+      if (customApiKey.trim()) {
+        headers['X-Gemini-Api-Key'] = customApiKey.trim();
+      }
+
       const response = await fetch('/api/niche', {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'X-App-Passcode': passcodeToSend,
-        },
+        headers,
         body: JSON.stringify({
           tipe_aset: tipeAset,
           tema: tema.trim(),
@@ -267,17 +260,6 @@ export const CariView: React.FC<CariViewProps> = ({
         }),
         signal: controller.signal,
       });
-
-      // Tangani kode 401 Kode Akses
-      if (response.status === 401) {
-        const errJson = await response.json().catch(() => ({}));
-        setModalPasscodeBuka(true);
-        setPasscodeError(errJson.pesan_galat || 'Kode akses salah atau belum dimasukkan.');
-        setPendingKunciCache(kunciCache);
-        setSedangMencari(false);
-        setPesanProgres('');
-        return;
-      }
 
       setPesanProgres('Langkah 2: Memetakan sumber byte UTF-8 dan menstrukturkan JSON...');
 
@@ -343,7 +325,7 @@ export const CariView: React.FC<CariViewProps> = ({
         web_search_queries: data.web_search_queries || [],
         search_entry_point_html: data.search_entry_point_html || null,
         status: data.status || 'tergrounded',
-        pesan_galat: null,
+        pesan_galat: data.pesan_galat || null,
         kandidat_ids: finalKandidat.map((k: KandidatNiche) => k.id),
       };
 
@@ -721,15 +703,32 @@ export const CariView: React.FC<CariViewProps> = ({
     <div className="space-y-4 min-w-0">
       {/* 2. ERROR BANNER */}
       {errorPesan && (
-        <div className="bg-rose-950/80 border border-rose-800 text-rose-200 text-xs p-3.5 rounded-2xl flex items-start gap-2.5 shadow-lg">
+        <div className="bg-rose-950/80 border border-rose-800 text-rose-200 text-xs p-3.5 rounded-2xl flex items-start gap-2.5 shadow-lg animate-fadeIn">
           <AlertCircle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
-          <div className="flex-1 space-y-0.5">
+          <div className="flex-1 space-y-1.5">
             <p className="font-bold">Pencarian Gagal</p>
             <p className="text-rose-300 text-[11px] leading-relaxed">{errorPesan}</p>
+            {(errorPesan.includes('429') ||
+              errorPesan.toLowerCase().includes('kuota') ||
+              errorPesan.toLowerCase().includes('kunci') ||
+              errorPesan.toLowerCase().includes('api key')) &&
+              onBukaPengaturan && (
+                <div className="pt-1">
+                  <button
+                    type="button"
+                    onClick={onBukaPengaturan}
+                    className="btn-min-touch inline-flex items-center gap-1.5 px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white rounded-xl font-bold text-xs shadow-md transition-all"
+                  >
+                    <KeyRound className="w-3.5 h-3.5" />
+                    <span>Buka Pengaturan untuk Input API Key</span>
+                  </button>
+                </div>
+              )}
           </div>
           <button
             onClick={() => setErrorPesan(null)}
             className="text-rose-400 hover:text-white text-xs font-bold px-1.5 py-0.5"
+            aria-label="Tutup"
           >
             ✕
           </button>
@@ -1030,72 +1029,6 @@ export const CariView: React.FC<CariViewProps> = ({
         </div>
       )}
 
-      {/* MODAL KODE AKSES PENGAMAN KUOTA (Tahap 6) */}
-      {modalPasscodeBuka && (
-        <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-black/80 backdrop-blur-sm p-0 sm:p-4">
-          <div className="w-full sm:max-w-[560px] bg-slate-900 border border-slate-700 rounded-t-3xl sm:rounded-2xl p-5 shadow-2xl space-y-3.5 animate-fadeIn">
-            <div className="flex items-center gap-2 text-white">
-              <Lock className="w-5 h-5 text-emerald-400 shrink-0" />
-              <h3 className="font-bold text-sm">Kode Akses Server</h3>
-            </div>
-            <p className="text-xs text-slate-300 leading-relaxed">
-              Pencarian niche memerlukan kode akses untuk menjaga kuota serverless. Silakan masukkan kode akses:
-            </p>
-
-            {passcodeError && (
-              <div className="p-2.5 bg-rose-950/70 border border-rose-800 rounded-xl text-xs text-rose-300 flex items-center gap-2">
-                <AlertCircle className="w-4 h-4 text-rose-400 shrink-0" />
-                <span>{passcodeError}</span>
-              </div>
-            )}
-
-            <form
-              onSubmit={(e) => {
-                e.preventDefault();
-                const code = inputPasscode.trim();
-                try {
-                  localStorage.setItem('niche_scout_passcode', code);
-                } catch {
-                  // localStorage error fallback
-                }
-                setModalPasscodeBuka(false);
-                setPasscodeError(null);
-                const targetKey = pendingKunciCache || generateCacheKey(tipeAset, tema.trim().slice(0, 80), momenId || null, jumlahKandidat);
-                eksekusiPanggilanServer(targetKey, code);
-              }}
-              className="space-y-3"
-            >
-              <input
-                type="password"
-                value={inputPasscode}
-                onChange={(e) => setInputPasscode(e.target.value)}
-                placeholder="Masukkan kode akses..."
-                autoFocus
-                className="w-full bg-slate-950 border border-slate-700 rounded-xl px-3.5 py-2.5 text-white font-mono placeholder-slate-500 focus:outline-none focus:border-emerald-500"
-                style={{ fontSize: '16px' }}
-              />
-              <div className="flex gap-2">
-                <button
-                  type="submit"
-                  className="btn-min-touch flex-1 bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs rounded-xl shadow-md transition-all"
-                >
-                  Simpan & Lanjutkan
-                </button>
-                <button
-                  type="button"
-                  onClick={() => {
-                    setModalPasscodeBuka(false);
-                    setPasscodeError(null);
-                  }}
-                  className="btn-min-touch px-4 bg-slate-800 text-slate-300 text-xs rounded-xl"
-                >
-                  Batal
-                </button>
-              </div>
-            </form>
-          </div>
-        </div>
-      )}
     </div>
   );
 };

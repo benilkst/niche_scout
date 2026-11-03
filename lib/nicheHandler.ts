@@ -8,16 +8,26 @@ import { GoogleGenAI, Type } from '@google/genai';
 import { GEMINI_MODEL_NAME } from '../src/config/model.ts';
 import type { KandidatNiche, SumberRef, StatusDukungan, LevelBukti } from '../src/types.ts';
 
-// Inisialisasi SDK di sisi server
-// Aturan 2: API key Gemini hanya di server (process.env.GEMINI_API_KEY)
-const ai = new GoogleGenAI({
-  apiKey: process.env.GEMINI_API_KEY,
-  httpOptions: {
-    headers: {
-      'User-Agent': 'aistudio-build',
+// Helper inisialisasi SDK di sisi server
+// Mendukung kunci API kustom yang diinput manual oleh pengguna dari aplikasi, dengan fallback ke process.env.GEMINI_API_KEY
+export function getAiClient(customApiKey?: string): GoogleGenAI {
+  const key = (customApiKey && typeof customApiKey === 'string' && customApiKey.trim())
+    ? customApiKey.trim()
+    : process.env.GEMINI_API_KEY;
+
+  if (!key) {
+    throw new Error('Kunci API Gemini belum diatur. Masukkan API Key Anda di Pengaturan aplikasi atau konfigurasi server.');
+  }
+
+  return new GoogleGenAI({
+    apiKey: key,
+    httpOptions: {
+      headers: {
+        'User-Agent': 'aistudio-build',
+      },
     },
-  },
-});
+  });
+}
 
 export interface NicheHandlerRequest {
   tipe_aset: 'foto_nyata' | 'foto_ai' | 'ilustrasi_ai';
@@ -233,6 +243,8 @@ function splitTextIntoCandidateBlocks(fullText: string): ParsedBlock[] {
  */
 async function executeStepBStructure(
   blocks: ParsedBlock[],
+  customApiKey?: string,
+  modelName: string = GEMINI_MODEL_NAME,
   retryCount: number = 0
 ): Promise<any[]> {
   const blocksInput = blocks.map((b) => ({
@@ -262,53 +274,67 @@ Peraturan Ekstraksi:
   - risiko_merek: objek { ada: boolean, alasan: string | null }
 `.trim();
 
-  const responseB = await ai.models.generateContent({
-    model: GEMINI_MODEL_NAME,
-    contents: promptB,
-    config: {
-      responseMimeType: 'application/json',
-      responseSchema: {
-        type: Type.ARRAY,
-        items: {
-          type: Type.OBJECT,
-          properties: {
-            nomor: { type: Type.INTEGER },
-            kata_kunci_en: { type: Type.STRING },
-            varian_id: { type: Type.STRING },
-            alasan: { type: Type.STRING },
-            sinyal_tren: { type: Type.STRING },
-            saran_sudut: {
+  const ai = getAiClient(customApiKey);
+  let responseB: any;
+  const modelsB = [modelName || GEMINI_MODEL_NAME, 'gemini-3.5-flash'];
+  const uniqueModelsB = Array.from(new Set(modelsB));
+
+  for (const m of uniqueModelsB) {
+    try {
+      responseB = await ai.models.generateContent({
+        model: m,
+        contents: promptB,
+        config: {
+          responseMimeType: 'application/json',
+          responseSchema: {
+            type: Type.ARRAY,
+            items: {
               type: Type.OBJECT,
               properties: {
-                copy_space: { type: Type.STRING },
-                konteks_lokal: { type: Type.STRING },
-                gaya: { type: Type.STRING },
-              },
-              required: ['copy_space', 'konteks_lokal', 'gaya'],
-            },
-            saran_permintaan_1_5: { type: Type.INTEGER },
-            risiko_merek: {
-              type: Type.OBJECT,
-              properties: {
-                ada: { type: Type.BOOLEAN },
+                nomor: { type: Type.INTEGER },
+                kata_kunci_en: { type: Type.STRING },
+                varian_id: { type: Type.STRING },
                 alasan: { type: Type.STRING },
+                sinyal_tren: { type: Type.STRING },
+                saran_sudut: {
+                  type: Type.OBJECT,
+                  properties: {
+                    copy_space: { type: Type.STRING },
+                    konteks_lokal: { type: Type.STRING },
+                    gaya: { type: Type.STRING },
+                  },
+                  required: ['copy_space', 'konteks_lokal', 'gaya'],
+                },
+                saran_permintaan_1_5: { type: Type.INTEGER },
+                risiko_merek: {
+                  type: Type.OBJECT,
+                  properties: {
+                    ada: { type: Type.BOOLEAN },
+                    alasan: { type: Type.STRING },
+                  },
+                  required: ['ada'],
+                },
               },
-              required: ['ada'],
+              required: [
+                'nomor',
+                'kata_kunci_en',
+                'varian_id',
+                'alasan',
+                'sinyal_tren',
+                'saran_sudut',
+                'risiko_merek',
+              ],
             },
           },
-          required: [
-            'nomor',
-            'kata_kunci_en',
-            'varian_id',
-            'alasan',
-            'sinyal_tren',
-            'saran_sudut',
-            'risiko_merek',
-          ],
         },
-      },
-    },
-  });
+      });
+      if (responseB?.text) break;
+    } catch (err: any) {
+      if (m === uniqueModelsB[uniqueModelsB.length - 1]) {
+        throw err;
+      }
+    }
+  }
 
   const parsed = JSON.parse(responseB.text || '[]');
   const list = Array.isArray(parsed) ? parsed : [];
@@ -320,7 +346,7 @@ Peraturan Ekstraksi:
   if (!isValidCount || !isNumbersMatching) {
     if (retryCount === 0) {
       // Coba ulang SEKALI sesuai spesifikasi
-      return executeStepBStructure(blocks, 1);
+      return executeStepBStructure(blocks, customApiKey, modelName, 1);
     }
     throw new Error(
       `Validasi Langkah B gagal: jumlah kandidat (${list.length}) tidak sesuai blok (${blocks.length}).`
@@ -333,7 +359,10 @@ Peraturan Ekstraksi:
 /**
  * Handler utama pencarian dua langkah
  */
-export async function handleNicheScout(params: NicheHandlerRequest): Promise<NicheHandlerResponse> {
+export async function handleNicheScout(
+  params: NicheHandlerRequest,
+  customApiKey?: string
+): Promise<NicheHandlerResponse> {
   const {
     tipe_aset,
     tema = '',
@@ -415,19 +444,74 @@ ATURAN SANGAT KETAT:
 `.trim();
 
   let responseA: any;
-  try {
-    responseA = await ai.models.generateContent({
-      model: GEMINI_MODEL_NAME,
-      contents: promptA,
-      config: {
-        tools: [{ googleSearch: {} }],
-      },
-    });
-  } catch (err: any) {
-    if (err?.status === 429 || err?.message?.includes('429') || err?.message?.includes('RESOURCE_EXHAUSTED')) {
-      throw new Error('429: Batas kuota permintaan Gemini API tercapai. Silakan coba kembali beberapa saat lagi.');
+  let modelBerhasil = GEMINI_MODEL_NAME;
+  let fallbackPesan: string | null = null;
+  const ai = getAiClient(customApiKey);
+
+  // Daftar model yang didukung (coba GEMINI_MODEL_NAME, fallback ke gemini-3.5-flash jika 503)
+  const modelsA = [GEMINI_MODEL_NAME, 'gemini-3.5-flash'];
+  const uniqueModelsA = Array.from(new Set(modelsA));
+
+  let groundingSuccess = false;
+  let lastErrorA: any = null;
+
+  // Percobaan 1: Menggunakan Google Search Grounding
+  for (const m of uniqueModelsA) {
+    try {
+      responseA = await ai.models.generateContent({
+        model: m,
+        contents: promptA,
+        config: {
+          tools: [{ googleSearch: {} }],
+        },
+      });
+      groundingSuccess = true;
+      modelBerhasil = m;
+      break;
+    } catch (err: any) {
+      lastErrorA = err;
+      const msg = err?.message || '';
+      // Jika 503 beban tinggi, coba model lain
+      if (err?.status === 503 || msg.includes('503') || msg.includes('UNAVAILABLE')) {
+        continue;
+      }
+      // Jika 429 pada tool Google Search (kuota grounding habis), langsung beralih ke fallback tanpa tool
+      if (err?.status === 429 || msg.includes('429') || msg.includes('RESOURCE_EXHAUSTED')) {
+        break;
+      }
     }
-    throw new Error('Gagal menghubungi layanan pencarian grounding Gemini.');
+  }
+
+  // Percobaan 2: Fallback anggun (ungrounded / tanpa Google Search tool) jika kuota search grounding habis
+  if (!groundingSuccess) {
+    const isQuotaExhausted =
+      lastErrorA?.status === 429 ||
+      lastErrorA?.message?.includes('429') ||
+      lastErrorA?.message?.includes('RESOURCE_EXHAUSTED');
+
+    for (const m of uniqueModelsA) {
+      try {
+        responseA = await ai.models.generateContent({
+          model: m,
+          contents: promptA,
+        });
+        groundingSuccess = true;
+        modelBerhasil = m;
+        fallbackPesan = isQuotaExhausted
+          ? 'Fitur Google Search Grounding mencapai batas kuota akun Anda. Hasil pencarian ditampilkan berbasis analisis tren Gemini (status Tanpa Sumber).'
+          : 'Pencarian web grounding tidak tersedia saat ini. Hasil ditampilkan berbasis analisis tren Gemini (status Tanpa Sumber).';
+        break;
+      } catch (err: any) {
+        lastErrorA = err;
+      }
+    }
+
+    if (!groundingSuccess) {
+      if (lastErrorA?.status === 429 || lastErrorA?.message?.includes('429') || lastErrorA?.message?.includes('RESOURCE_EXHAUSTED')) {
+        throw new Error('429: Batas kuota permintaan Gemini API tercapai pada akun ini. Silakan coba kembali beberapa saat lagi.');
+      }
+      throw new Error('Gagal menghubungi layanan Gemini: ' + (lastErrorA?.message || ''));
+    }
   }
 
   const candidateZero = responseA?.candidates?.[0];
@@ -467,7 +551,7 @@ ATURAN SANGAT KETAT:
   );
 
   // 5. LANGKAH B: JSON terstruktur via Gemini (tanpa tool)
-  const structuredList = await executeStepBStructure(blocks);
+  const structuredList = await executeStepBStructure(blocks, customApiKey, modelBerhasil);
 
   // 6. GABUNGKAN HASIL LANGKAH B DENGAN SUMBER DAN CAKUPAN DARI KODE
   const idPencarian = `search-${Date.now()}`;
@@ -539,7 +623,7 @@ ATURAN SANGAT KETAT:
     success: true,
     kunci_cache,
     status: isGrounded ? 'tergrounded' : 'tidak_tergrounded',
-    pesan_galat: null,
+    pesan_galat: fallbackPesan,
     web_search_queries: webSearchQueries,
     search_entry_point_html: searchEntryPointHtml,
     kandidat: finalKandidat,
@@ -547,48 +631,10 @@ ATURAN SANGAT KETAT:
 }
 
 /**
- * Aturan 4 (Tahap 6): Perbandingan timing-safe untuk kode akses
+ * Verifikasi kode akses dinonaktifkan (diizinkan untuk semua akses)
+ * Memenuhi instruksi: "Hilangkan kode akses dan buat agar api key dapat diinput secara manual melalui aplikasi"
  */
-export function verifyPasscode(providedPasscode: string | undefined | null): { allowed: boolean; status?: number; error?: string } {
-  const envPasscode = process.env.APP_PASSCODE;
-  const isProd = process.env.NODE_ENV === 'production';
-
-  // Jika di lingkungan pratinjau AI Studio / dev dan APP_PASSCODE belum diatur, boleh dilewati
-  if (!envPasscode) {
-    if (isProd) {
-      // Gagal tertutup di produksi jika APP_PASSCODE belum diatur (tolak semua panggilan)
-      return {
-        allowed: false,
-        status: 401,
-        error: 'Akses ditolak. Konfigurasi kode akses server belum diatur di produksi.',
-      };
-    }
-    // Pratinjau AI Studio / dev: boleh dilewati jika APP_PASSCODE kosong
-    return { allowed: true };
-  }
-
-  // Jika APP_PASSCODE diatur, kode akses wajib ada dan cocok
-  if (!providedPasscode || typeof providedPasscode !== 'string') {
-    return {
-      allowed: false,
-      status: 401,
-      error: 'Kode akses diperlukan. Silakan masukkan kode akses pada aplikasi.',
-    };
-  }
-
-  // Bandingkan secara timing-safe menggunakan SHA-256 digest untuk menjamin panjang buffer sama persis
-  const hashProvided = crypto.createHash('sha256').update(providedPasscode).digest();
-  const hashEnv = crypto.createHash('sha256').update(envPasscode).digest();
-
-  const isMatch = crypto.timingSafeEqual(hashProvided, hashEnv);
-  if (!isMatch) {
-    return {
-      allowed: false,
-      status: 401,
-      error: 'Kode akses salah. Silakan periksa kembali kode akses Anda.',
-    };
-  }
-
+export function verifyPasscode(_providedPasscode: string | undefined | null): { allowed: boolean; status?: number; error?: string } {
   return { allowed: true };
 }
 
@@ -607,24 +653,18 @@ export async function handleApiNicheRequest(req: any, res: any): Promise<void> {
     return;
   }
 
-  // 1. Verifikasi Kode Akses
-  const headerPasscode =
-    req.headers?.['x-app-passcode'] ||
-    req.headers?.['X-App-Passcode'] ||
-    req.headers?.['x-app-passcode'.toLowerCase()];
+  // 1. Ambil Kunci API Gemini kustom dari header (jika pengguna memasukkannya manual di aplikasi)
+  const clientApiKey =
+    req.headers?.['x-gemini-api-key'] ||
+    req.headers?.['X-Gemini-Api-Key'] ||
+    req.headers?.['x-gemini-api-key'.toLowerCase()];
 
-  const auth = verifyPasscode(typeof headerPasscode === 'string' ? headerPasscode : undefined);
-  if (!auth.allowed) {
-    res.status(auth.status || 401).json({
-      success: false,
-      status: 'galat',
-      pesan_galat: auth.error || 'Akses tidak sah.',
-      kandidat: [],
-    });
-    return;
-  }
+  const effectiveApiKey =
+    typeof clientApiKey === 'string' && clientApiKey.trim().length > 0
+      ? clientApiKey.trim()
+      : undefined;
 
-  // 2. Validasi Server (tanpa membocorkan detail internal atau mencatat isi input ke log)
+  // 2. Validasi Server
   const body = req.body || {};
   const {
     tipe_aset,
@@ -670,12 +710,12 @@ export async function handleApiNicheRequest(req: any, res: any): Promise<void> {
     return;
   }
 
-  // 3. Pastikan GEMINI_API_KEY tersedia di server
-  if (!process.env.GEMINI_API_KEY) {
-    res.status(500).json({
+  // 3. Pastikan API key tersedia (baik dari header klien maupun environment server)
+  if (!effectiveApiKey && !process.env.GEMINI_API_KEY) {
+    res.status(400).json({
       success: false,
       status: 'galat',
-      pesan_galat: 'Layanan sedang sibuk. Silakan coba kembali nanti.',
+      pesan_galat: 'Kunci API Gemini belum diatur. Silakan masukkan API Key Anda di tab Pengaturan.',
       kandidat: [],
     });
     return;
@@ -683,33 +723,187 @@ export async function handleApiNicheRequest(req: any, res: any): Promise<void> {
 
   // 4. Jalankan riset niche dua langkah
   try {
-    const result = await handleNicheScout({
-      tipe_aset,
-      tema: typeof tema === 'string' ? tema.trim() : '',
-      momen_id: momen_id || null,
-      momen_tahun: momen_tahun || null,
-      nama_momen: typeof nama_momen === 'string' ? nama_momen : null,
-      tanggal_puncak_target: typeof tanggal_puncak_target === 'string' ? tanggal_puncak_target : null,
-      status_jendela: status_jendela || null,
-      hari_tersisa: typeof hari_tersisa === 'number' ? hari_tersisa : null,
-      rentang_jendela: typeof rentang_jendela === 'string' ? rentang_jendela : null,
-      jumlah_kandidat: count,
-    });
+    const result = await handleNicheScout(
+      {
+        tipe_aset,
+        tema: typeof tema === 'string' ? tema.trim() : '',
+        momen_id: momen_id || null,
+        momen_tahun: momen_tahun || null,
+        nama_momen: typeof nama_momen === 'string' ? nama_momen : null,
+        tanggal_puncak_target: typeof tanggal_puncak_target === 'string' ? tanggal_puncak_target : null,
+        status_jendela: status_jendela || null,
+        hari_tersisa: typeof hari_tersisa === 'number' ? hari_tersisa : null,
+        rentang_jendela: typeof rentang_jendela === 'string' ? rentang_jendela : null,
+        jumlah_kandidat: count,
+      },
+      effectiveApiKey
+    );
 
     res.status(200).json(result);
   } catch (err: any) {
     const msg = err?.message || '';
     const isRateLimit = msg.includes('429') || msg.includes('RESOURCE_EXHAUSTED');
+    const isUnavailable = msg.includes('503') || msg.includes('UNAVAILABLE') || msg.includes('high demand');
+    const isAuthError = msg.includes('API_KEY_INVALID') || msg.includes('403') || msg.includes('API key not valid');
 
-    res.status(isRateLimit ? 429 : 500).json({
+    let pesanGalat = 'Layanan sedang sibuk. Gagal memproses pencarian niche saat ini.';
+    let statusCode = 500;
+
+    if (isRateLimit) {
+      statusCode = 429;
+      pesanGalat = 'Batas kuota Gemini API tercapai (HTTP 429). Silakan masukkan API Key baru di tab Pengaturan atau tunggu reset kuota.';
+    } else if (isAuthError) {
+      statusCode = 403;
+      pesanGalat = 'Kunci API Gemini tidak valid atau tidak diizinkan. Silakan periksa kembali API Key di tab Pengaturan.';
+    } else if (isUnavailable) {
+      statusCode = 503;
+      pesanGalat = 'Model Gemini sedang mengalami lonjakan beban server (HTTP 503). Mohon coba beberapa saat lagi.';
+    } else if (msg) {
+      pesanGalat = msg.slice(0, 180);
+    }
+
+    res.status(statusCode).json({
       success: false,
       status: 'galat',
-      pesan_galat: isRateLimit
-        ? 'Layanan sedang sibuk (batas kuota API tercapai). Mohon tunggu beberapa saat sebelum mencoba kembali.'
-        : 'Layanan sedang sibuk. Gagal memproses pencarian niche saat ini.',
+      pesan_galat: pesanGalat,
       web_search_queries: [],
       search_entry_point_html: null,
       kandidat: [],
+    });
+  }
+}
+
+/**
+ * Endpoint pengujian kunci API langsung dari halaman Pengaturan
+ */
+export async function handleApiTestKeyRequest(req: any, res: any): Promise<void> {
+  if (req.method !== 'POST') {
+    res.status(405).json({ success: false, message: 'Metode harus POST.' });
+    return;
+  }
+
+  const clientApiKey =
+    req.body?.apiKey ||
+    req.headers?.['x-gemini-api-key'] ||
+    req.headers?.['X-Gemini-Api-Key'];
+
+  const testKey =
+    typeof clientApiKey === 'string' && clientApiKey.trim().length > 0
+      ? clientApiKey.trim()
+      : process.env.GEMINI_API_KEY;
+
+  if (!testKey) {
+    res.status(200).json({
+      success: false,
+      message: 'Kunci API belum diisi. Masukkan kunci API Gemini terlebih dahulu.',
+    });
+    return;
+  }
+
+  try {
+    // 1. Verifikasi autentikasi cepat ke Google Generative Language API (<300ms)
+    const directUrl = `https://generativelanguage.googleapis.com/v1beta/models?key=${encodeURIComponent(testKey)}&pageSize=1`;
+    const authRes = await fetch(directUrl, {
+      signal: AbortSignal.timeout(3500),
+    });
+
+    if (!authRes.ok) {
+      const errBody: any = await authRes.json().catch(() => ({}));
+      const errCode = authRes.status;
+      const errMsg = errBody?.error?.message || '';
+
+      if (
+        errCode === 401 ||
+        errCode === 400 ||
+        errCode === 403 ||
+        errMsg.includes('API_KEY_INVALID') ||
+        errMsg.includes('ACCESS_TOKEN_TYPE_UNSUPPORTED') ||
+        errMsg.includes('not valid')
+      ) {
+        res.status(200).json({
+          success: false,
+          isValidKey: false,
+          message: 'Kunci API tidak valid atau salah karakter (HTTP 400/401). Pastikan menyalin seluruh teks kunci dari Google AI Studio.',
+        });
+        return;
+      }
+
+      if (errCode === 429 || errMsg.includes('RESOURCE_EXHAUSTED')) {
+        res.status(200).json({
+          success: false,
+          isValidKey: true,
+          isQuotaExhausted: true,
+          message: 'Kunci API valid, namun kuota akun ini telah habis (HTTP 429 RESOURCE_EXHAUSTED). Gunakan kunci dari akun Google lain.',
+        });
+        return;
+      }
+
+      res.status(200).json({
+        success: false,
+        message: `Google API merespons status ${errCode}: ${errMsg.slice(0, 120)}`,
+      });
+      return;
+    }
+
+    // 2. Kunci terbukti valid dan terautentikasi oleh Google!
+    // Jalankan probe singkat (maksimal 2.5 detik) untuk mengecek ketersediaan kuota inferensi
+    let isQuotaExhausted = false;
+    let isHighDemand = false;
+
+    try {
+      const ai = new GoogleGenAI({
+        apiKey: testKey,
+        httpOptions: {
+          headers: { 'User-Agent': 'aistudio-build' },
+        },
+      });
+
+      await Promise.race([
+        ai.models.generateContent({
+          model: GEMINI_MODEL_NAME,
+          contents: 'Ping',
+        }),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('PROBE_TIMEOUT')), 2500)),
+      ]);
+    } catch (probeErr: any) {
+      const pMsg = probeErr?.message || '';
+      if (probeErr?.status === 429 || pMsg.includes('429') || pMsg.includes('RESOURCE_EXHAUSTED')) {
+        isQuotaExhausted = true;
+      } else if (probeErr?.status === 503 || pMsg.includes('503') || pMsg.includes('UNAVAILABLE')) {
+        isHighDemand = true;
+      }
+      // Jika PROBE_TIMEOUT, abaikan karena kunci sudah terbukti valid pada langkah 1
+    }
+
+    if (isQuotaExhausted) {
+      res.status(200).json({
+        success: false,
+        isValidKey: true,
+        isQuotaExhausted: true,
+        message: 'Kunci API valid dan terdaftar, TETAPI kuota permintaan akun Google ini telah habis (HTTP 429 RESOURCE_EXHAUSTED). Anda perlu membuat API Key baru dari akun Google lain.',
+      });
+      return;
+    }
+
+    if (isHighDemand) {
+      res.status(200).json({
+        success: true,
+        isValidKey: true,
+        message: 'Kunci API aktif dan valid! (Catatan: Server Gemini sedang mengalami lonjakan beban sementara HTTP 503, kunci tetap dapat disimpan).',
+      });
+      return;
+    }
+
+    res.status(200).json({
+      success: true,
+      isValidKey: true,
+      message: 'Koneksi berhasil! Kunci API Gemini aktif dan siap digunakan untuk mencari ide niche.',
+    });
+  } catch (err: any) {
+    const msg = err?.message || '';
+    res.status(200).json({
+      success: false,
+      message: `Pemeriksaan kunci selesai dengan catatan: ${msg.slice(0, 120) || 'Koneksi jaringan lambat.'}`,
     });
   }
 }

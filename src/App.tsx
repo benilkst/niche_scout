@@ -295,6 +295,7 @@ export default function App() {
             onClearReopenedData={() => setReopenedData(null)}
             momenAwalId={momenTerpilihId}
             onBukaPanduan={handleBukaPanduan}
+            onBukaPengaturan={() => setTabAktif('pengaturan')}
           />
         )}
 

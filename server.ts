@@ -221,6 +221,12 @@ app.post('/api/niche', async (req, res) => {
   return handleApiNicheRequest(req, res);
 });
 
+// Endpoint untuk menguji kunci API Gemini langsung dari Pengaturan
+app.post('/api/test-key', async (req, res) => {
+  const { handleApiTestKeyRequest } = await import('./lib/nicheHandler.ts');
+  return handleApiTestKeyRequest(req, res);
+});
+
 // Endpoint status kesehatan backend
 app.get('/api/health', (_req, res) => {
   res.json({

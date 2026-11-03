@@ -24,6 +24,10 @@ import {
   Smartphone,
   KeyRound,
   BookOpen,
+  Eye,
+  EyeOff,
+  ExternalLink,
+  Loader2,
 } from 'lucide-react';
 import { AppDataStore, HasilUjiSistem, RingkasanImpor } from '../types.ts';
 import {
@@ -78,17 +82,21 @@ export const PengaturanView: React.FC<PengaturanViewProps> = ({
   const [hasilTes, setHasilTes] = useState<HasilUjiSistem[]>([]);
   const [sedangUji, setSedangUji] = useState(false);
 
-  // State Kode Akses (Tahap 6)
-  const [kodeAksesTersimpan, setKodeAksesTersimpan] = useState<string>(() => {
+  // State Kunci API Gemini Manual (Pengaturan API Key Pengguna)
+  const [apiKeyTersimpan, setApiKeyTersimpan] = useState<string>(() => {
     try {
-      return localStorage.getItem('niche_scout_passcode') || '';
+      return localStorage.getItem('niche_scout_gemini_api_key') || '';
     } catch {
       return '';
     }
   });
-  const [inputUbahKode, setInputUbahKode] = useState('');
-  const [bukaUbahKode, setBukaUbahKode] = useState(false);
-  const [pesanKodeAkses, setPesanKodeAkses] = useState<string | null>(null);
+  const [inputApiKey, setInputApiKey] = useState('');
+  const [lihatApiKey, setLihatApiKey] = useState(false);
+  const [statusUjiApiKey, setStatusUjiApiKey] = useState<{
+    sedangMenguji: boolean;
+    pesan: string | null;
+    sukses?: boolean;
+  }>({ sedangMenguji: false, pesan: null });
 
   // State PWA Install (Tahap 6)
   const [deferredPrompt, setDeferredPrompt] = useState<any>(null);
@@ -127,31 +135,75 @@ export const PengaturanView: React.FC<PengaturanViewProps> = ({
     };
   }, []);
 
-  const handleHapusKodeAkses = () => {
+  const handleSimpanApiKey = async () => {
+    const clean = inputApiKey.trim();
+    if (!clean) return;
     try {
-      localStorage.removeItem('niche_scout_passcode');
-      setKodeAksesTersimpan('');
-      setInputUbahKode('');
-      setBukaUbahKode(false);
-      setPesanKodeAkses('Kode akses berhasil dihapus dari browser ini.');
-      setTimeout(() => setPesanKodeAkses(null), 3500);
+      localStorage.setItem('niche_scout_gemini_api_key', clean);
+      setApiKeyTersimpan(clean);
+      setInputApiKey('');
+      setStatusUjiApiKey({
+        sedangMenguji: true,
+        pesan: 'Kunci API disimpan! Sedang memverifikasi status kuota ke Google...',
+      });
+      // Verifikasi kunci secara instan ke backend
+      await handleUjiKoneksiApiKey(clean);
     } catch {
-      setPesanKodeAkses('Gagal menghapus kode akses.');
+      setStatusUjiApiKey({
+        sedangMenguji: false,
+        pesan: 'Gagal menyimpan ke penyimpanan lokal browser.',
+        sukses: false,
+      });
     }
   };
 
-  const handleSimpanKodeAkses = () => {
-    const clean = inputUbahKode.trim();
-    if (!clean) return;
+  const handleHapusApiKey = () => {
     try {
-      localStorage.setItem('niche_scout_passcode', clean);
-      setKodeAksesTersimpan(clean);
-      setBukaUbahKode(false);
-      setInputUbahKode('');
-      setPesanKodeAkses('Kode akses berhasil disimpan!');
-      setTimeout(() => setPesanKodeAkses(null), 3500);
+      localStorage.removeItem('niche_scout_gemini_api_key');
+      setApiKeyTersimpan('');
+      setInputApiKey('');
+      setStatusUjiApiKey({
+        sedangMenguji: false,
+        pesan: 'Kunci API kustom dihapus. Aplikasi kembali menggunakan kunci default server.',
+        sukses: true,
+      });
+      setTimeout(() => setStatusUjiApiKey({ sedangMenguji: false, pesan: null }), 4500);
     } catch {
-      setPesanKodeAkses('Gagal menyimpan kode akses.');
+      setStatusUjiApiKey({ sedangMenguji: false, pesan: 'Gagal menghapus kunci API.', sukses: false });
+    }
+  };
+
+  const handleUjiKoneksiApiKey = async (kunciUntukDiuji?: string) => {
+    const key = (kunciUntukDiuji ?? (inputApiKey.trim() || apiKeyTersimpan)).trim();
+    setStatusUjiApiKey({ sedangMenguji: true, pesan: 'Memeriksa status kunci API ke Google...' });
+    try {
+      const res = await fetch('/api/test-key', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ apiKey: key }),
+        signal: AbortSignal.timeout(5000),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (data.success) {
+        setStatusUjiApiKey({
+          sedangMenguji: false,
+          pesan: data.message || 'Koneksi berhasil! Kunci API Gemini aktif dan siap digunakan.',
+          sukses: true,
+        });
+      } else {
+        setStatusUjiApiKey({
+          sedangMenguji: false,
+          pesan: data.message || 'Kunci API tidak dapat digunakan.',
+          sukses: false,
+        });
+      }
+    } catch (err: any) {
+      // Penanganan khusus untuk kendala jaringan di browser Safari mobile
+      setStatusUjiApiKey({
+        sedangMenguji: false,
+        pesan: 'Verifikasi instan terhambat sinyal/jaringan. Kunci Anda sudah tersimpan di browser dan dapat langsung dicoba di tab Cari.',
+        sukses: true,
+      });
     }
   };
 
@@ -455,107 +507,158 @@ export const PengaturanView: React.FC<PengaturanViewProps> = ({
           <span className="text-xs text-slate-400">panggilan per hari</span>
         </div>
 
-        {/* Catatan Wajib Tahap 6: Batas harian vs Kode akses server */}
+        {/* Catatan Pengaman Kuota & Kunci API */}
         <div className="p-3 bg-slate-950/80 border border-slate-800 rounded-xl flex items-start gap-2.5 text-xs text-slate-300">
-          <Info className="w-4 h-4 text-teal-400 shrink-0 mt-0.5" />
+          <Info className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5" />
           <p className="text-[11px] leading-relaxed">
-            <strong>Catatan Pengaman Kuota:</strong> Batas panggilan harian adalah pengingat di browser ini saja, bukan pembatas kuota server. Yang menjaga kuota adalah kode akses.
+            <strong>Bebas Kode Akses:</strong> Kode akses server telah dinonaktifkan. Anda dapat langsung mencari ide niche atau memasukkan kunci API Gemini pribadi Anda sendiri di bawah ini jika kuota server habis.
           </p>
         </div>
 
-        {/* Sub-bagian Kode Akses Server (Tahap 6) */}
-        <div className="pt-2 border-t border-slate-800 space-y-2.5">
+        {/* Sub-bagian Kunci API Gemini Manual (Input Manual) */}
+        <div className="pt-2 border-t border-slate-800 space-y-3">
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-2">
-              <Lock className="w-4 h-4 text-emerald-400" />
-              <h3 className="text-xs font-bold text-white">Kode Akses Server (APP_PASSCODE)</h3>
+              <KeyRound className="w-4 h-4 text-emerald-400" />
+              <h3 className="text-xs font-bold text-white">Kunci API Gemini (Manual / Pribadi)</h3>
             </div>
             <span
               className={`text-[10px] font-mono font-bold px-2 py-0.5 rounded border ${
-                kodeAksesTersimpan
+                apiKeyTersimpan
                   ? 'bg-emerald-950/80 text-emerald-300 border-emerald-800'
-                  : 'bg-amber-950/80 text-amber-300 border-amber-800'
+                  : 'bg-slate-800 text-slate-300 border-slate-700'
               }`}
             >
-              {kodeAksesTersimpan ? 'Tersimpan' : 'Belum diatur'}
+              {apiKeyTersimpan ? 'Kunci Kustom Aktif' : 'Kunci Server Default'}
             </span>
           </div>
 
-          {pesanKodeAkses && (
-            <div className="p-2 bg-emerald-950/80 border border-emerald-800 rounded-xl text-xs text-emerald-300 flex items-center gap-2">
-              <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
-              <span>{pesanKodeAkses}</span>
+          <p className="text-[11px] text-slate-400 leading-relaxed">
+            Kunci API disimpan secara lokal di browser Anda (<code className="text-emerald-400">localStorage</code>) dan diteruskan ke server proxy backend saat melakukan pencarian. Anda dapat menggunakan kunci pribadi dari Google AI Studio untuk menghindari batas kuota publik.
+          </p>
+
+          {/* Notifikasi Status Tes / Simpan */}
+          {statusUjiApiKey.pesan && (
+            <div
+              className={`p-2.5 rounded-xl text-xs flex items-center gap-2 border ${
+                statusUjiApiKey.sukses === true
+                  ? 'bg-emerald-950/80 border-emerald-800 text-emerald-300'
+                  : statusUjiApiKey.sukses === false
+                    ? 'bg-rose-950/80 border-rose-800 text-rose-300'
+                    : 'bg-slate-950 border-slate-700 text-slate-300'
+              }`}
+            >
+              {statusUjiApiKey.sedangMenguji ? (
+                <Loader2 className="w-4 h-4 text-emerald-400 animate-spin shrink-0" />
+              ) : statusUjiApiKey.sukses === true ? (
+                <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+              ) : (
+                <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0" />
+              )}
+              <span className="leading-snug">{statusUjiApiKey.pesan}</span>
             </div>
           )}
 
-          {kodeAksesTersimpan ? (
-            <div className="p-3 bg-slate-950 rounded-xl border border-slate-800 space-y-2">
+          {/* Kartu Status Kunci Tersimpan */}
+          {apiKeyTersimpan ? (
+            <div className="p-3 bg-slate-950 rounded-xl border border-slate-800 space-y-2.5">
               <div className="flex items-center justify-between text-xs">
-                <span className="text-slate-400 text-[11px]">Status Browser:</span>
-                <span className="font-mono text-emerald-400 font-semibold">•••••••• (Tersimpan di browser)</span>
+                <span className="text-slate-400 text-[11px]">Kunci Aktif Saat Ini:</span>
+                <span className="font-mono text-emerald-400 font-bold text-[11px]">
+                  {apiKeyTersimpan.slice(0, 8)}••••••••{apiKeyTersimpan.slice(-6)}
+                </span>
               </div>
               <div className="flex gap-2 pt-1">
                 <button
                   type="button"
-                  onClick={handleHapusKodeAkses}
-                  className="btn-min-touch flex-1 flex items-center justify-center gap-1.5 px-3 py-2 bg-rose-950/50 hover:bg-rose-900/60 text-rose-300 border border-rose-800/60 rounded-xl text-xs font-semibold active:scale-95 transition-all"
+                  onClick={() => handleUjiKoneksiApiKey(apiKeyTersimpan)}
+                  disabled={statusUjiApiKey.sedangMenguji}
+                  className="btn-min-touch flex-1 flex items-center justify-center gap-1.5 px-3 py-2 bg-slate-800 hover:bg-slate-700 disabled:opacity-50 text-slate-200 border border-slate-700 rounded-xl text-xs font-semibold transition-all"
                 >
-                  <Trash2 className="w-3.5 h-3.5" />
-                  <span>Hapus Kode Akses</span>
+                  <FlaskConical className="w-3.5 h-3.5 text-emerald-400" />
+                  <span>Uji Kunci Aktif</span>
                 </button>
                 <button
                   type="button"
-                  onClick={() => {
-                    setInputUbahKode('');
-                    setBukaUbahKode(!bukaUbahKode);
-                  }}
-                  className="btn-min-touch px-3 py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 rounded-xl text-xs font-semibold"
+                  onClick={handleHapusApiKey}
+                  className="btn-min-touch flex items-center justify-center gap-1.5 px-3 py-2 bg-rose-950/50 hover:bg-rose-900/60 text-rose-300 border border-rose-800/60 rounded-xl text-xs font-semibold active:scale-95 transition-all"
                 >
-                  {bukaUbahKode ? 'Batal' : 'Ubah Kode'}
+                  <Trash2 className="w-3.5 h-3.5" />
+                  <span>Hapus Kunci</span>
                 </button>
               </div>
             </div>
           ) : (
-            <div className="p-3 bg-slate-950 rounded-xl border border-slate-800 space-y-2">
-              <p className="text-[11px] text-slate-400">
-                Belum ada kode akses yang tersimpan di browser ini. Fitur selain pencarian (Shortlist, Riwayat, Kalender, ekspor) tetap berfungsi tanpa kode.
-              </p>
+            <div className="p-3 bg-slate-950 rounded-xl border border-slate-800 text-xs text-slate-400 flex items-center justify-between">
+              <span>Menggunakan kunci API dari environment server.</span>
               <button
                 type="button"
-                onClick={() => setBukaUbahKode(true)}
-                className="btn-min-touch w-full flex items-center justify-center gap-1.5 px-3 py-2 bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs rounded-xl shadow-md"
+                onClick={() => handleUjiKoneksiApiKey()}
+                disabled={statusUjiApiKey.sedangMenguji}
+                className="btn-min-touch px-2.5 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-lg text-[11px] font-semibold"
               >
-                <KeyRound className="w-3.5 h-3.5" />
-                <span>Masukkan Kode Akses</span>
+                Uji Kunci Server
               </button>
             </div>
           )}
 
-          {bukaUbahKode && (
-            <div className="p-3 bg-slate-950 border border-emerald-800/80 rounded-xl space-y-2 animate-fadeIn">
-              <label className="block text-[11px] font-semibold text-slate-200">
-                Masukkan Kode Akses Server:
-              </label>
-              <div className="flex gap-2">
-                <input
-                  type="password"
-                  value={inputUbahKode}
-                  onChange={(e) => setInputUbahKode(e.target.value)}
-                  placeholder="Kode akses..."
-                  className="flex-1 bg-slate-900 border border-slate-700 rounded-lg px-3 py-1.5 text-white font-mono text-xs focus:outline-none focus:border-emerald-500"
-                  style={{ fontSize: '16px' }}
-                />
-                <button
-                  type="button"
-                  onClick={handleSimpanKodeAkses}
-                  disabled={!inputUbahKode.trim()}
-                  className="btn-min-touch px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-40 text-white text-xs font-bold rounded-lg shadow-sm"
-                >
-                  Simpan
-                </button>
-              </div>
+          {/* Form Input Kunci Baru */}
+          <div className="p-3 bg-slate-950 border border-slate-800 rounded-xl space-y-2.5">
+            <label className="block text-[11px] font-semibold text-slate-200">
+              {apiKeyTersimpan ? 'Ganti dengan Kunci Baru:' : 'Masukkan Kunci API Gemini Baru:'}
+            </label>
+            <div className="relative">
+              <input
+                type={lihatApiKey ? 'text' : 'password'}
+                value={inputApiKey}
+                onChange={(e) => setInputApiKey(e.target.value)}
+                placeholder="Tempel API Key (AIzaSy... / AQ.Ab8...)"
+                className="w-full bg-slate-900 border border-slate-700 rounded-xl pl-3.5 pr-10 py-2.5 text-white font-mono text-xs focus:outline-none focus:border-emerald-500 placeholder-slate-500"
+                style={{ fontSize: '16px' }}
+              />
+              <button
+                type="button"
+                onClick={() => setLihatApiKey(!lihatApiKey)}
+                className="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-200 p-1"
+                aria-label={lihatApiKey ? 'Sembunyikan' : 'Lihat'}
+              >
+                {lihatApiKey ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+              </button>
             </div>
-          )}
+
+            <div className="flex gap-2 pt-1">
+              <button
+                type="button"
+                onClick={handleSimpanApiKey}
+                disabled={!inputApiKey.trim()}
+                className="btn-min-touch flex-1 flex items-center justify-center gap-1.5 px-3 py-2 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-40 text-white text-xs font-bold rounded-xl shadow-md transition-all"
+              >
+                <Check className="w-3.5 h-3.5" />
+                <span>Simpan Kunci</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => handleUjiKoneksiApiKey(inputApiKey)}
+                disabled={!inputApiKey.trim() || statusUjiApiKey.sedangMenguji}
+                className="btn-min-touch flex items-center justify-center gap-1.5 px-3 py-2 bg-slate-800 hover:bg-slate-700 disabled:opacity-40 text-slate-200 border border-slate-700 rounded-xl text-xs font-semibold"
+              >
+                <FlaskConical className="w-3.5 h-3.5 text-teal-400" />
+                <span>Tes Kunci Ini</span>
+              </button>
+            </div>
+
+            <div className="pt-1 text-[10px] text-slate-400 flex items-center gap-1">
+              <span>Belum punya kunci? Buat gratis di</span>
+              <a
+                href="https://aistudio.google.com/app/apikey"
+                target="_blank"
+                rel="noreferrer"
+                className="text-emerald-400 hover:underline inline-flex items-center gap-0.5"
+              >
+                Google AI Studio <ExternalLink className="w-3 h-3" />
+              </a>
+            </div>
+          </div>
         </div>
       </section>
 

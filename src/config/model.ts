@@ -5,6 +5,6 @@
 
 /**
  * Aturan 6: Nama model Gemini disimpan di satu konstanta konfigurasi.
- * Model yang direkomendasikan Build mode dan mendukung Google Search grounding: 'gemini-3.8-flash'
+ * Model cepat, stabil, dan mendukung Google Search grounding: 'gemini-3.5-flash'
  */
-export const GEMINI_MODEL_NAME = 'gemini-3.8-flash' as const;
+export const GEMINI_MODEL_NAME = 'gemini-3.5-flash' as const;

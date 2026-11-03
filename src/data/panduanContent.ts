@@ -207,9 +207,9 @@ export const PANDUAN_DATA: PanduanBagian[] = [
       header: ['Masalah', 'Kemungkinan Penyebab', 'Solusi'],
       baris: [
         [
-          'Galat 401 (Tidak Diizinkan)',
-          'Kode akses belum dimasukkan atau salah.',
-          'Buka dialog kode akses atau masukkan kode akses yang tepat di tab Pengaturan sesuai setelan peladen.',
+          'Batas Kuota Tercapai (Galat 429)',
+          'Batas panggilan gratis Google Gemini API pada kunci server/akun telah habis.',
+          'Buka tab Pengaturan dan masukkan Kunci API Gemini Anda sendiri (dari Google AI Studio) pada bagian Kunci API Gemini Manual.',
         ],
         [
           'Pencarian Menghasilkan 0 Ide',
