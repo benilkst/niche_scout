@@ -233,22 +233,21 @@ export const CariView: React.FC<CariViewProps> = ({
         customApiKey = '';
       }
 
+      // Bersihkan karakter tak kasat mata atau newline yang sering terbawa dari clipboard iOS
+      const cleanApiKey = customApiKey ? customApiKey.replace(/[^\x20-\x7E]/g, '').trim() : '';
+
       const selectedMomen = store.momen.find((m) => m.id === momenId);
       const jendela = selectedMomen ? hitungJendelaMomen(selectedMomen) : null;
 
-      const headers: Record<string, string> = {
-        'Content-Type': 'application/json',
-      };
-      if (customApiKey.trim()) {
-        headers['X-Gemini-Api-Key'] = customApiKey.trim();
-      }
-
       const response = await fetch('/api/niche', {
         method: 'POST',
-        headers,
+        headers: {
+          'Content-Type': 'application/json',
+        },
         body: JSON.stringify({
           tipe_aset: tipeAset,
           tema: tema.trim(),
+          apiKey: cleanApiKey || undefined,
           momen_id: momenId || null,
           momen_tahun: jendela?.target_tahun || null,
           nama_momen: selectedMomen?.nama || null,
@@ -337,7 +336,12 @@ export const CariView: React.FC<CariViewProps> = ({
       if (err.name === 'AbortError') {
         return;
       }
-      setErrorPesan(err?.message || 'Terjadi gangguan jaringan atau server.');
+      const rawMsg = err?.message || '';
+      let userMsg = rawMsg;
+      if (rawMsg.toLowerCase().includes('load failed')) {
+        userMsg = 'Koneksi ke server terputus atau batas waktu terlampaui (Load failed). Kuota API Key mungkin sedang habis atau model mengalami lonjakan beban. Silakan periksa kunci API di tab Pengaturan.';
+      }
+      setErrorPesan(userMsg);
     } finally {
       setSedangMencari(false);
       setPesanProgres('');
@@ -708,21 +712,50 @@ export const CariView: React.FC<CariViewProps> = ({
           <div className="flex-1 space-y-1.5">
             <p className="font-bold">Pencarian Gagal</p>
             <p className="text-rose-300 text-[11px] leading-relaxed">{errorPesan}</p>
-            {(errorPesan.includes('429') ||
-              errorPesan.toLowerCase().includes('kuota') ||
-              errorPesan.toLowerCase().includes('kunci') ||
-              errorPesan.toLowerCase().includes('api key')) &&
-              onBukaPengaturan && (
-                <div className="pt-1">
+            {(errorPesan.includes('503') ||
+              errorPesan.toLowerCase().includes('lonjakan') ||
+              errorPesan.toLowerCase().includes('beban') ||
+              errorPesan.toLowerCase().includes('sementara')) ? (
+                <div className="pt-1.5 flex flex-wrap gap-2">
                   <button
                     type="button"
-                    onClick={onBukaPengaturan}
-                    className="btn-min-touch inline-flex items-center gap-1.5 px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white rounded-xl font-bold text-xs shadow-md transition-all"
+                    onClick={() => {
+                      setErrorPesan(null);
+                      handleMulaiPencarian(true);
+                    }}
+                    className="btn-min-touch inline-flex items-center gap-1.5 px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white rounded-xl font-bold text-xs shadow-md transition-all active:scale-95"
                   >
-                    <KeyRound className="w-3.5 h-3.5" />
-                    <span>Buka Pengaturan untuk Input API Key</span>
+                    <RotateCcw className="w-3.5 h-3.5" />
+                    <span>Coba Lagi Sekarang</span>
                   </button>
+                  {onBukaPengaturan && (
+                    <button
+                      type="button"
+                      onClick={onBukaPengaturan}
+                      className="btn-min-touch inline-flex items-center gap-1.5 px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 rounded-xl font-bold text-xs transition-all"
+                    >
+                      <KeyRound className="w-3.5 h-3.5 text-emerald-400" />
+                      <span>Ganti Kunci API</span>
+                    </button>
+                  )}
                 </div>
+              ) : (
+                (errorPesan.includes('429') ||
+                  errorPesan.toLowerCase().includes('kuota') ||
+                  errorPesan.toLowerCase().includes('kunci') ||
+                  errorPesan.toLowerCase().includes('api key')) &&
+                onBukaPengaturan && (
+                  <div className="pt-1.5">
+                    <button
+                      type="button"
+                      onClick={onBukaPengaturan}
+                      className="btn-min-touch inline-flex items-center gap-1.5 px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white rounded-xl font-bold text-xs shadow-md transition-all active:scale-95"
+                    >
+                      <KeyRound className="w-3.5 h-3.5" />
+                      <span>Buka Pengaturan untuk Input API Key</span>
+                    </button>
+                  </div>
+                )
               )}
           </div>
           <button

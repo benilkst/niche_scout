@@ -136,7 +136,7 @@ export const PengaturanView: React.FC<PengaturanViewProps> = ({
   }, []);
 
   const handleSimpanApiKey = async () => {
-    const clean = inputApiKey.trim();
+    const clean = inputApiKey.replace(/[^\x20-\x7E]/g, '').trim();
     if (!clean) return;
     try {
       localStorage.setItem('niche_scout_gemini_api_key', clean);
@@ -174,7 +174,8 @@ export const PengaturanView: React.FC<PengaturanViewProps> = ({
   };
 
   const handleUjiKoneksiApiKey = async (kunciUntukDiuji?: string) => {
-    const key = (kunciUntukDiuji ?? (inputApiKey.trim() || apiKeyTersimpan)).trim();
+    const rawKey = kunciUntukDiuji ?? (inputApiKey || apiKeyTersimpan);
+    const key = (rawKey || '').replace(/[^\x20-\x7E]/g, '').trim();
     setStatusUjiApiKey({ sedangMenguji: true, pesan: 'Memeriksa status kunci API ke Google...' });
     try {
       const res = await fetch('/api/test-key', {

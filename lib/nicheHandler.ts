@@ -443,117 +443,200 @@ ATURAN SANGAT KETAT:
    - AI: ingatkan hindari wajah tokoh nyata dan merek dagang.
 `.trim();
 
+/**
+ * Generator langsung 1-turn tanpa tool jika kuota pencarian grounding habis.
+ * Menghasilkan kandidat dalam ~8 detik (mencegah timeout Load failed di Safari).
+ */
+async function executeDirectUngroundedCandidates(
+  payload: NicheHandlerRequest,
+  customApiKey?: string,
+  modelName: string = GEMINI_MODEL_NAME
+): Promise<any[]> {
+  const ai = getAiClient(customApiKey);
+  const { tipe_aset, tema, nama_momen, rentang_jendela, status_jendela, jumlah_kandidat } = payload;
+  const count = Math.min(Math.max(jumlah_kandidat || 10, 3), 15);
+
+  const assetLabel =
+    tipe_aset === 'foto_nyata'
+      ? 'Foto Nyata / Real Photography (otentik, model nyata, staging fisik)'
+      : tipe_aset === 'foto_ai'
+        ? 'Foto AI Generatif Komersial (konsep visual AI fotorealistik)'
+        : 'Ilustrasi AI / Vektor AI (flat, 3D render komersial, isolasi)';
+
+  const prompt = `
+Peran: Anda adalah kurator riset tren pasar microstock (Adobe Stock, Shutterstock, Freepik, Getty Images).
+Hasilkan tepat ${count} ide niche komersial microstock yang spesifik, relevan, dan tinggi permintaannya.
+
+Parameter:
+- Tipe Aset: ${assetLabel}
+- Tema: ${tema || 'Tren microstock paling dicari saat ini'}
+${nama_momen ? `- Momen Musiman: ${nama_momen} (${status_jendela || ''}, target ${rentang_jendela || ''})` : ''}
+
+Peraturan:
+1. Hasilkan tepat ${count} objek kandidat dalam array JSON.
+2. Setiap objek WAJIB memiliki:
+   - nomor: integer (1 sampai ${count})
+   - kata_kunci_en: string (5-8 kata kunci komersial bahasa Inggris dipisahkan koma)
+   - varian_id: string (konsep visual dalam Bahasa Indonesia)
+   - alasan: string (1-2 kalimat ringkas mengapa pembeli membutuhkan foto ini)
+   - sinyal_tren: string ("Sinyal tidak ditemukan" atau tren musiman relevan)
+   - saran_sudut: objek { copy_space: string, konteks_lokal: string, gaya: string }
+   - risiko_merek: objek { ada: boolean, alasan: string | null }
+3. JANGAN PERNAH menyarankan merek dagang berhak cipta (Lego, Apple, Nike, Barbie, Disney, dll.).
+`.trim();
+
+  const candidateModels = [modelName || GEMINI_MODEL_NAME, 'gemini-3.8-flash', 'gemini-flash-latest'];
+  const uniqueCandidateModels = Array.from(new Set(candidateModels));
+  let response: any = null;
+  let lastErr: any = null;
+
+  for (const m of uniqueCandidateModels) {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        response = await ai.models.generateContent({
+          model: m,
+          contents: prompt,
+          config: {
+            responseMimeType: 'application/json',
+            responseSchema: {
+              type: Type.ARRAY,
+              items: {
+                type: Type.OBJECT,
+                properties: {
+                  nomor: { type: Type.INTEGER },
+                  kata_kunci_en: { type: Type.STRING },
+                  varian_id: { type: Type.STRING },
+                  alasan: { type: Type.STRING },
+                  sinyal_tren: { type: Type.STRING },
+                  saran_sudut: {
+                    type: Type.OBJECT,
+                    properties: {
+                      copy_space: { type: Type.STRING },
+                      konteks_lokal: { type: Type.STRING },
+                      gaya: { type: Type.STRING },
+                    },
+                    required: ['copy_space', 'konteks_lokal', 'gaya'],
+                  },
+                  risiko_merek: {
+                    type: Type.OBJECT,
+                    properties: {
+                      ada: { type: Type.BOOLEAN },
+                      alasan: { type: Type.STRING },
+                    },
+                    required: ['ada'],
+                  },
+                },
+                required: [
+                  'nomor',
+                  'kata_kunci_en',
+                  'varian_id',
+                  'alasan',
+                  'sinyal_tren',
+                  'saran_sudut',
+                  'risiko_merek',
+                ],
+              },
+            },
+          },
+        });
+        if (response?.text) break;
+      } catch (err: any) {
+        lastErr = err;
+        const msg = err?.message || '';
+        // Jika 503 lonjakan beban, tunggu sejenak lalu retry atau coba model berikutnya
+        if (err?.status === 503 || msg.includes('503') || msg.includes('UNAVAILABLE')) {
+          if (attempt === 0) {
+            await new Promise((r) => setTimeout(r, 1200));
+            continue;
+          }
+        }
+        // JIKA 429 (KUOTA PROYEK HABIS): HENTIKAN SELURUH LOOP SEGERA!
+        // Batas kuota Free Tier Google (20 req/hari) berlaku untuk SELURUH model di project ini.
+        // Langsung lempar error agar server merespons dalam 1 detik (mencegah Load failed di Safari).
+        if (err?.status === 429 || msg.includes('429') || msg.includes('RESOURCE_EXHAUSTED')) {
+          throw new Error('429: Batas kuota harian akun Google Anda (Free Tier 20 permintaan/hari) telah tercapai. Silakan masukkan API Key dari akun Google lain di tab Pengaturan.');
+        }
+      }
+    }
+    if (response?.text) break;
+  }
+
+  if (!response?.text) {
+    throw lastErr || new Error('Gagal menghasilkan kandidat niche.');
+  }
+
+  const parsed = JSON.parse(response.text || '[]');
+  return Array.isArray(parsed) ? parsed : [];
+}
+
   let responseA: any;
-  let modelBerhasil = GEMINI_MODEL_NAME;
+  let modelBerhasil: string = GEMINI_MODEL_NAME;
   let fallbackPesan: string | null = null;
   const ai = getAiClient(customApiKey);
 
-  // Daftar model yang didukung (coba GEMINI_MODEL_NAME, fallback ke gemini-3.5-flash jika 503)
-  const modelsA = [GEMINI_MODEL_NAME, 'gemini-3.5-flash'];
-  const uniqueModelsA = Array.from(new Set(modelsA));
-
   let groundingSuccess = false;
-  let lastErrorA: any = null;
+  let isGrounded = false;
+  let structuredList: any[] = [];
+  let sourceMapping = new Map<number, { sumber: SumberRef[]; cakupan_dukungan: number | null }>();
+  let webSearchQueries: string[] = [];
+  let searchEntryPointHtml: string | null = null;
 
-  // Percobaan 1: Menggunakan Google Search Grounding
-  for (const m of uniqueModelsA) {
-    try {
-      responseA = await ai.models.generateContent({
-        model: m,
-        contents: promptA,
-        config: {
-          tools: [{ googleSearch: {} }],
-        },
-      });
+  // Percobaan 1: Menggunakan Google Search Grounding (timeout ketat 5 detik)
+  try {
+    const searchPromise = ai.models.generateContent({
+      model: GEMINI_MODEL_NAME,
+      contents: promptA,
+      config: {
+        tools: [{ googleSearch: {} }],
+      },
+    });
+
+    responseA = await Promise.race([
+      searchPromise,
+      new Promise((_, reject) => setTimeout(() => reject(new Error('SEARCH_TIMEOUT')), 3500)),
+    ]);
+
+    const candidateZero = responseA?.candidates?.[0];
+    const groundingMetadata = candidateZero?.groundingMetadata;
+    const groundingChunks = Array.isArray(groundingMetadata?.groundingChunks)
+      ? groundingMetadata.groundingChunks
+      : [];
+
+    if (groundingChunks.length > 0) {
       groundingSuccess = true;
-      modelBerhasil = m;
-      break;
-    } catch (err: any) {
-      lastErrorA = err;
-      const msg = err?.message || '';
-      // Jika 503 beban tinggi, coba model lain
-      if (err?.status === 503 || msg.includes('503') || msg.includes('UNAVAILABLE')) {
-        continue;
-      }
-      // Jika 429 pada tool Google Search (kuota grounding habis), langsung beralih ke fallback tanpa tool
-      if (err?.status === 429 || msg.includes('429') || msg.includes('RESOURCE_EXHAUSTED')) {
-        break;
-      }
-    }
-  }
+      isGrounded = true;
+      webSearchQueries = Array.isArray(groundingMetadata?.webSearchQueries)
+        ? groundingMetadata.webSearchQueries
+        : [];
+      searchEntryPointHtml = groundingMetadata?.searchEntryPoint?.renderedContent || null;
 
-  // Percobaan 2: Fallback anggun (ungrounded / tanpa Google Search tool) jika kuota search grounding habis
-  if (!groundingSuccess) {
-    const isQuotaExhausted =
-      lastErrorA?.status === 429 ||
-      lastErrorA?.message?.includes('429') ||
-      lastErrorA?.message?.includes('RESOURCE_EXHAUSTED');
+      const fullText = responseA?.text || '';
+      const blocks = splitTextIntoCandidateBlocks(fullText);
 
-    for (const m of uniqueModelsA) {
-      try {
-        responseA = await ai.models.generateContent({
-          model: m,
-          contents: promptA,
-        });
-        groundingSuccess = true;
-        modelBerhasil = m;
-        fallbackPesan = isQuotaExhausted
-          ? 'Fitur Google Search Grounding mencapai batas kuota akun Anda. Hasil pencarian ditampilkan berbasis analisis tren Gemini (status Tanpa Sumber).'
-          : 'Pencarian web grounding tidak tersedia saat ini. Hasil ditampilkan berbasis analisis tren Gemini (status Tanpa Sumber).';
-        break;
-      } catch (err: any) {
-        lastErrorA = err;
+      if (blocks.length > 0) {
+        sourceMapping = mapSourcesToBlocksByByteOffset(
+          fullText,
+          blocks,
+          groundingChunks,
+          Array.isArray(groundingMetadata?.groundingSupports) ? groundingMetadata.groundingSupports : []
+        );
+        structuredList = await executeStepBStructure(blocks, customApiKey, modelBerhasil);
       }
     }
-
-    if (!groundingSuccess) {
-      if (lastErrorA?.status === 429 || lastErrorA?.message?.includes('429') || lastErrorA?.message?.includes('RESOURCE_EXHAUSTED')) {
-        throw new Error('429: Batas kuota permintaan Gemini API tercapai pada akun ini. Silakan coba kembali beberapa saat lagi.');
-      }
-      throw new Error('Gagal menghubungi layanan Gemini: ' + (lastErrorA?.message || ''));
-    }
+  } catch (err: any) {
+    groundingSuccess = false;
+    isGrounded = false;
   }
 
-  const candidateZero = responseA?.candidates?.[0];
-  const fullText = responseA?.text || '';
-  const groundingMetadata = candidateZero?.groundingMetadata;
-
-  const webSearchQueries: string[] = Array.isArray(groundingMetadata?.webSearchQueries)
-    ? groundingMetadata.webSearchQueries
-    : [];
-
-  const searchEntryPointHtml: string | null =
-    groundingMetadata?.searchEntryPoint?.renderedContent || null;
-
-  const groundingChunks = Array.isArray(groundingMetadata?.groundingChunks)
-    ? groundingMetadata.groundingChunks
-    : [];
-
-  const groundingSupports = Array.isArray(groundingMetadata?.groundingSupports)
-    ? groundingMetadata.groundingSupports
-    : [];
-
-  const isGrounded = !!(groundingChunks.length > 0);
-
-  // 3. Pemecahan teks menjadi blok-blok kandidat
-  const blocks = splitTextIntoCandidateBlocks(fullText);
-
-  if (blocks.length === 0) {
-    throw new Error('Format jawaban Langkah A tidak menghasilkan blok kandidat yang dapat dibaca.');
+  // Percobaan 2: Jika Google Search grounding gagal atau kuota habis (429/timeout),
+  // langsung gunakan single-turn generator cepat tanpa grounding (hanya ~8 detik)
+  if (!groundingSuccess || structuredList.length === 0) {
+    fallbackPesan =
+      'Fitur Google Search Grounding mencapai batas kuota akun Anda. Hasil pencarian ditampilkan berbasis analisis tren Gemini (status Tanpa Sumber).';
+    structuredList = await executeDirectUngroundedCandidates(params, customApiKey, modelBerhasil);
   }
 
-  // 4. PEMETAAN SUMBER OLEH KODE MENGGUNAKAN OFFSET BYTE UTF-8
-  const sourceMapping = mapSourcesToBlocksByByteOffset(
-    fullText,
-    blocks,
-    groundingChunks,
-    groundingSupports
-  );
-
-  // 5. LANGKAH B: JSON terstruktur via Gemini (tanpa tool)
-  const structuredList = await executeStepBStructure(blocks, customApiKey, modelBerhasil);
-
-  // 6. GABUNGKAN HASIL LANGKAH B DENGAN SUMBER DAN CAKUPAN DARI KODE
+  // 6. GABUNGKAN HASIL DENGAN SUMBER DAN CAKUPAN DARI KODE
   const idPencarian = `search-${Date.now()}`;
   const nowIso = new Date().toISOString();
 
@@ -653,19 +736,22 @@ export async function handleApiNicheRequest(req: any, res: any): Promise<void> {
     return;
   }
 
-  // 1. Ambil Kunci API Gemini kustom dari header (jika pengguna memasukkannya manual di aplikasi)
+  // 1. Ambil data request body
+  const body = req.body || {};
+
+  // Ambil Kunci API Gemini kustom dari body (aman dari batasan header WebKit) atau header
   const clientApiKey =
+    body.apiKey ||
     req.headers?.['x-gemini-api-key'] ||
     req.headers?.['X-Gemini-Api-Key'] ||
     req.headers?.['x-gemini-api-key'.toLowerCase()];
 
   const effectiveApiKey =
     typeof clientApiKey === 'string' && clientApiKey.trim().length > 0
-      ? clientApiKey.trim()
+      ? clientApiKey.replace(/[^\x20-\x7E]/g, '').trim()
       : undefined;
 
   // 2. Validasi Server
-  const body = req.body || {};
   const {
     tipe_aset,
     tema,
@@ -750,19 +836,17 @@ export async function handleApiNicheRequest(req: any, res: any): Promise<void> {
     let statusCode = 500;
 
     if (isRateLimit) {
-      statusCode = 429;
-      pesanGalat = 'Batas kuota Gemini API tercapai (HTTP 429). Silakan masukkan API Key baru di tab Pengaturan atau tunggu reset kuota.';
+      pesanGalat = 'Batas kuota harian akun Google Anda (Free Tier 20 permintaan/hari) telah tercapai (HTTP 429). Silakan masukkan API Key dari akun Google lain di tab Pengaturan untuk langsung melanjutkan riset.';
     } else if (isAuthError) {
-      statusCode = 403;
       pesanGalat = 'Kunci API Gemini tidak valid atau tidak diizinkan. Silakan periksa kembali API Key di tab Pengaturan.';
     } else if (isUnavailable) {
-      statusCode = 503;
-      pesanGalat = 'Model Gemini sedang mengalami lonjakan beban server (HTTP 503). Mohon coba beberapa saat lagi.';
+      pesanGalat = 'Server Google Gemini sedang mengalami lonjakan beban sementara (HTTP 503). Silakan klik "Coba Lagi" atau masukkan API Key dari akun lain.';
     } else if (msg) {
       pesanGalat = msg.slice(0, 180);
     }
 
-    res.status(statusCode).json({
+    // Selalu kirim status HTTP 200 agar peramban Safari di iOS iframe tidak menganggapnya sebagai koneksi terputus (Load failed)
+    res.status(200).json({
       success: false,
       status: 'galat',
       pesan_galat: pesanGalat,
